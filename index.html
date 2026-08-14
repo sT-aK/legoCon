@@ -324,9 +324,12 @@ let autoReconnects = 0;            // 自動再接続の実行回数
 let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
 let dropCount = 0;                 // 意図しない切断の回数
 let connectedSince = 0;            // 接続が確立した時刻
+let hubSystemType = null;          // ハブの機種 ID
 let notifyWorking = false;         // ハブからの通知が受け取れているか
 let lastGotoTime = 0;              // 直近に角度指令を送った時刻
 let steerNeedsSub = true;          // 舵角の購読がまだなら true
+let steerRawTarget = 0;            // 出力指定モードでの目標出力
+let steerHoldStart = 0;            // その目標になった時刻
 let scanCurrentPort = null;        // ポートスキャンで今試しているポート
 const scanRejected = new Set();    // 指令を拒否したポート
 let holdTest = false;              // 接続保持テストの実行中
@@ -503,6 +506,12 @@ function cmdHubProperty(prop){
   return new Uint8Array([0x05, 0x00, 0x01, prop, 0x05]);
 }
 const HUB_PROPS = { 0x01:"名前", 0x03:"ファームウェア", 0x04:"ハードウェア", 0x06:"バッテリー", 0x0B:"機種 ID" };
+// 実機で確認したポート構成。ポートスキャンで指令の受理を確認し、
+// 実際に車輪とステアリングが動くことを目視で確認済み。
+const KNOWN_LAYOUTS = {
+  0x84: { name:"Technic Move Hub", drive:[50, 51], steer:52 },
+};
+
 const SYSTEM_TYPES = {
   0x00:"WeDo 2.0 Hub", 0x20:"Duplo Train", 0x40:"BOOST Move Hub", 0x41:"2-Port Hub (City)",
   0x42:"2-Port Handset", 0x80:"Technic Hub (Control+)", 0x84:"Technic Move Hub",
@@ -554,6 +563,7 @@ function onNotify(event){
       log(`${HUB_PROPS[prop]}バージョン: ${hex(body)}`);
     }
     if (prop === 0x0B && body.length >= 1){
+      hubSystemType = body[0];
       log(`機種 ID: 0x${body[0].toString(16).padStart(2,"0")} (${SYSTEM_TYPES[body[0]] || "一覧にない機種"})`);
     }
 
@@ -815,6 +825,7 @@ async function openHub(){
                 `  このハブが持つポート: ${found.map(portLabel).join(", ")}\n` +
                 "  診断の「ポートスキャン」でどのポートが動くか確かめ、「ポート割り当て」で設定してください。");
           }
+          applyKnownLayout(found);
           logAssignment();
         }, 2000);
         return true;
@@ -1229,6 +1240,24 @@ function loop(){
 }
 
 // 検出が効いているのに存在しないポートへ送っても、ハブがエラーを返すだけ。
+// 割り当てが空のときだけ、既知の構成を当てはめる。
+// 手で設定した内容を上書きはしない。
+function applyKnownLayout(found){
+  const layout = KNOWN_LAYOUTS[hubSystemType];
+  if (!layout) return;
+  if (Object.keys(cfg.roles).some(k => cfg.roles[k] !== "none")) return;
+
+  const ports = [...layout.drive, layout.steer];
+  if (!ports.every(p => found.includes(p))) return;
+
+  for (const p of layout.drive) cfg.roles[p] = "drive";
+  cfg.roles[layout.steer] = "steer";
+  save(); applyRoles(); renderPorts();
+  log(`${layout.name} の既定の構成を適用しました — ` +
+      `駆動: ${layout.drive.map(portLabel).join(", ")} / ステアリング: ${portLabel(layout.steer)}\n` +
+      "  車体がその場で回る・前に進まない場合は、駆動の片方を「駆動（反転）」に変えてください。");
+}
+
 function logAssignment(){
   const drive = Object.keys(cfg.roles).filter(k => cfg.roles[k].startsWith("drive")).map(Number);
   const steer = Object.keys(cfg.roles).filter(k => cfg.roles[k] === "steer").map(Number);
@@ -1289,11 +1318,17 @@ function sendControl(throttle, steer){
     $("outSteerActual").textContent =
       (steerActual === null) ? "—" : ((steerActual - (steerCenter ?? 0)) + " °");
   } else {
-    const sp = Math.round(steer * cfg.steerPower);
+    // 出力指定では舵角が読めないため、切った先はメカストップに当たったまま止まる。
+    // 全力を掛け続けると発熱するので、切り終えたあとの保持は出力を半分に落とす。
+    const target = Math.round(steer * cfg.steerPower);
+    if (target !== steerRawTarget){ steerRawTarget = target; steerHoldStart = performance.now(); }
+    const holding = target !== 0 && performance.now() - steerHoldStart > 400;
+    const sp = holding ? Math.round(target * 0.5) : target;
+
     if (lastSteer === null || Math.abs(sp - lastSteer) >= 3 || (sp === 0 && lastSteer !== 0)){
       queueCommand("s" + steerPort, cmdPower(steerPort, sp), sp === 0);
       lastSteer = sp;
-      $("outSteerTarget").textContent = sp + " %";
+      $("outSteerTarget").textContent = sp + " %" + (holding ? "（保持）" : "");
     }
     $("outSteerActual").textContent = "—";
   }
