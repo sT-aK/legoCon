@@ -308,6 +308,7 @@ let intentionalDisconnect = false; // 「切断」ボタンによる切断
 let selfDisconnect = false;        // やり直しのために自分で切断した
 let autoReconnects = 0;            // 自動再接続の実行回数
 let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
+let notifyWorking = false;         // ハブからの通知が受け取れているか
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
 let testing = false;               // 診断テスト中は通常の制御出力を止める
@@ -480,7 +481,7 @@ function cmdHubProperty(prop){
 const HUB_PROPS = { 0x01:"名前", 0x03:"ファームウェア", 0x04:"ハードウェア", 0x06:"バッテリー", 0x0B:"機種 ID" };
 const SYSTEM_TYPES = {
   0x00:"WeDo 2.0 Hub", 0x20:"Duplo Train", 0x40:"BOOST Move Hub", 0x41:"2-Port Hub (City)",
-  0x42:"2-Port Handset", 0x80:"Technic Hub (Control+)",
+  0x42:"2-Port Handset", 0x80:"Technic Hub (Control+)", 0x84:"Technic Move Hub",
 };
 
 /* ============================================================
@@ -638,13 +639,21 @@ async function connectOnce(){
   // 機種 ID を要求し、応答が返ることで通信の成立を確認する。
   // ここを通るまで connected を立てない。立てると制御ループが書き込みを始めてしまい、
   // ハンドシェイクの書き込みと GATT 操作が衝突する。
-  if (!await handshake()) throw new Error("ハブが応答しません");
+  const result = await handshake();
+  if (result === "fail") throw new Error("ハブに書き込めません");
+  notifyWorking = (result === "ok");
 
   connected = true;
   setConnUI(true);
   $("hubName").textContent = device.name || "(名前なし)";
   log(`接続完了 — 書き込み方式: ${cfg.writeMode === "without" ? "応答なし" : "応答あり"}`
       + ` (対応: ${canWrite ? "write" : "-"}/${canWriteWithoutResponse ? "writeWithoutResponse" : "-"})`);
+  if (!notifyWorking){
+    $("btState").textContent = "接続中（送信のみ）";
+    log("⚠ ハブからの通知が受け取れません。送信のみで動作します。\n" +
+        "  モーターは動かせますが、ポートの自動検出・バッテリー表示・舵角フィードバックは使えません。\n" +
+        "  診断の「ポートスキャン」でどのポートが動くか確認し、ステアリングは「出力指定」に切り替えてください。");
+  }
 
   applyRoles();
   requestWakeLock();
@@ -667,7 +676,7 @@ async function openHub(){
         queueCommand("battery", CMD_BATTERY_SUB, true);
         const gen = ++connectGen;
         setTimeout(() => {
-          if (gen === connectGen && connected && Object.keys(detected).length === 0){
+          if (gen === connectGen && connected && notifyWorking && Object.keys(detected).length === 0){
             log("⚠ モーターが 1 つも検出されていません。診断の「ポートスキャン」でどのポートが動くか確認してください。");
           }
         }, 2000);
@@ -686,11 +695,14 @@ async function openHub(){
   }
 }
 
+// 戻り値: "ok" = 送受信とも成立 / "write-only" = 書き込みは通るが応答が来ない / "fail" = 書き込みも通らない
 async function handshake(){
+  let wroteOk = false;
   for (let i = 1; i <= 3; i++){
     const before = rxCount;
     try {
       await writeRaw(cmdHubProperty(0x0B));
+      wroteOk = true;
     } catch (e){
       log(`ハンドシェイク送信に失敗 (${i}/3): ${e.message}`);
       await sleep(500);
@@ -698,11 +710,13 @@ async function handshake(){
     }
     for (let t = 0; t < 20; t++){
       await sleep(50);
-      if (rxCount > before) return true;
+      if (rxCount > before) return "ok";
     }
     log(`ハブからの応答待ちがタイムアウトしました (${i}/3)`);
   }
-  return false;
+  // 書き込みが通っているならモーターは動かせる。通知はポート検出・
+  // バッテリー・舵角フィードバックにしか使わないので、そこは諦めて先に進む。
+  return wroteOk ? "write-only" : "fail";
 }
 
 $("connectBtn").addEventListener("click", async () => {

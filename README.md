@@ -117,6 +117,47 @@ Netlify や Vercel にドラッグ&ドロップしても同じです。
 
 ---
 
+## edge://bluetooth-internals で切り分ける
+
+ページのコードを完全に排除して、ハブと OS の間だけを検証できます。
+Edge なら `edge://bluetooth-internals/#devices`、Chrome なら `chrome://bluetooth-internals/#devices` を開き、
+**Start Discovery** → `Technic Move` の **Connect** → サービス一覧を確認します。
+
+正常なハブなら次のように見えます。
+
+```
+GATT Connected: Connected
+Services: 00001623-1212-efde-1623-785feabcd123, 00001800-…, 00001801-…, f000ffc0-…
+  00001623-1212-efde-1623-785feabcd123
+    00001624-1212-efde-1623-785feabcd123
+      Properties: Write Without Response, Write, Notify
+Manufacturer Data: 0x0397 0x008402ff0100
+```
+
+- `00001623` / `00001624` があり、`Write` と `Notify` が立っていれば、このページの前提どおりです
+- `f000ffc0-0451-…` は TI 製チップのファームウェア更新サービスで、LEGO ハブでは正常な構成です
+- Manufacturer Data の `0x0397` は LEGO 社の Company ID、続く 2 バイト目 `84` が**機種 ID（Technic Move Hub）**です
+
+> **重要**: この画面で接続したままにすると、ハブはその接続に占有されます。
+> ページを試す前に必ず **Disconnect**（または Forget）を押し、bluetooth-internals のタブを閉じてください。
+> 押し忘れると、ページ側は `Connection already in progress` や接続直後の切断として現れます。
+
+---
+
+## 通知が受け取れないとき（送信のみモード）
+
+`startNotifications` に失敗しても、**モーターを動かすだけなら書き込みだけで足ります**。
+通知が必要なのはポートの自動検出・バッテリー表示・舵角フィードバックだけです。
+
+そのため、書き込みが通っていて応答だけが来ない場合は、状態表示を **「接続中（送信のみ）」** にして走行可能なまま接続します。
+この状態では次のようにしてください。
+
+- **ポート割り当て**: 自動検出できないので、診断の「ポートスキャン」でどのポートが動くかを実機で確認して設定する
+- **ステアリング**: 舵角が読めないので、走行設定の制御方式を「出力指定」に切り替える。
+  「ステア最大トルク」は低め（30〜50%）にして、端当ての負荷を抑える
+
+---
+
 ## `GATT Server is disconnected` が出るとき
 
 ```
