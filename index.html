@@ -135,6 +135,9 @@
     <thead><tr><th style="width:56px">ポート</th><th>検出されたデバイス</th><th style="width:150px">役割</th></tr></thead>
     <tbody id="portTable"></tbody>
   </table>
+  <div class="row" style="margin-top:10px">
+    <button id="applyLayoutBtn" class="ghost" disabled>確認済みの構成を適用</button>
+  </div>
   <p class="note">ハブを接続すると、そのハブが持つポートと接続されているデバイスが自動で表示されます。内蔵モーターの番号は機種によって異なり、Technic Move Hub では 50 番以降に並びます。どれが駆動でどれがステアリングかは、診断の「ポートスキャン」で実機を動かして確かめてください。</p>
 </div>
 
@@ -332,6 +335,8 @@ let steerRawTarget = 0;            // 出力指定モードでの目標出力
 let steerHoldStart = 0;            // その目標になった時刻
 let scanCurrentPort = null;        // ポートスキャンで今試しているポート
 const scanRejected = new Set();    // 指令を拒否したポート
+const badPorts = new Set();        // モーター指令を拒否したポート（送信対象から外す）
+const recentOutputs = [];          // 直近に出力指令を送ったポートの履歴
 let holdTest = false;              // 接続保持テストの実行中
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
@@ -393,8 +398,16 @@ const pending = new Map();         // key -> { bytes, force }
 let draining = false, drainTimer = null;
 const MIN_INTERVAL_MS = 35;        // 同一ポートへの最短送信間隔（BLE の帯域を守る）
 
+function noteOutput(bytes){
+  if (bytes[2] !== 0x81) return;
+  const now = performance.now();
+  recentOutputs.push({ port: bytes[3], time: now });
+  while (recentOutputs.length && now - recentOutputs[0].time > 600) recentOutputs.shift();
+}
+
 function queueCommand(key, bytes, force){
   if (!characteristic) return;
+  noteOutput(bytes);
   pending.set(key, { bytes, force: !!force });   // 同じポートの古い指示は自動的に上書きされる
   drain();
 }
@@ -578,6 +591,24 @@ function onNotify(event){
     };
     log(`ハブがエラーを返しました: command 0x${d[3].toString(16)} → ${codes[d[4]] || "0x" + d[4].toString(16)}`);
     if (d[3] === 0x81 && scanCurrentPort !== null) scanRejected.add(scanCurrentPort);
+
+    // モーター指令を拒否するポートに送り続けると、ハブが接続を切ることがある。
+    // 直近の送り先を控えてあるので、そのポートを対象から外す。
+    if (d[3] === 0x81 && scanCurrentPort === null){
+      // 直近 600ms の送信先が 1 つに定まるときだけ、そのポートのせいだと判断する。
+      // 複数ポートへ送った直後は、どれが弾かれたのか区別できない。
+      const now = performance.now();
+      const ports = new Set(recentOutputs.filter(o => now - o.time < 600).map(o => o.port));
+      if (ports.size === 1){
+        const port = [...ports][0];
+        if (!badPorts.has(port)){
+          badPorts.add(port);
+          log(`⚠ ポート ${portLabel(port)} はモーター指令を受け付けません。送信対象から外します。\n` +
+              "  「ポート割り当て」を見直してください。ここに送り続けると接続が切れることがあります。");
+          lastDrive = null; lastSteer = null;
+        }
+      }
+    }
 
     if (d[3] === 0x81 && cfg.steerMode === "position" && performance.now() - lastGotoTime < 800){
       cfg.steerMode = "power";
@@ -826,6 +857,7 @@ async function openHub(){
                 "  診断の「ポートスキャン」でどのポートが動くか確かめ、「ポート割り当て」で設定してください。");
           }
           applyKnownLayout(found);
+          checkLayout();
           logAssignment();
         }, 2000);
         return true;
@@ -1046,6 +1078,7 @@ function renderPorts(){
         for (const q of Object.keys(cfg.roles)) if (Number(q) !== p && cfg.roles[q] === "steer") cfg.roles[q] = "none";
       }
       cfg.roles[p] = sel.value;
+      badPorts.delete(p);            // 割り当てを変えたら再度試す
       save(); applyRoles(); renderPorts();
     });
     tdRole.appendChild(sel);
@@ -1061,7 +1094,7 @@ function applyRoles(){
   for (const k of Object.keys(cfg.roles)) if (cfg.roles[k] === "steer") steerPort = Number(k);
   if (steerPort !== prev){
     steerActual = null; steerCenter = null;
-    if (prev !== null && connected) queueCommand("p" + prev, cmdPower(prev, 0), true);
+    if (prev !== null && connected && !badPorts.has(prev)) queueCommand("p" + prev, cmdPower(prev, 0), true);
   }
   // 購読は実際にステアリングを操作したときに行う。
   // 接続直後に送るコマンドを増やすと、切断の原因を切り分けられなくなる。
@@ -1240,23 +1273,53 @@ function loop(){
 }
 
 // 検出が効いているのに存在しないポートへ送っても、ハブがエラーを返すだけ。
-// 割り当てが空のときだけ、既知の構成を当てはめる。
-// 手で設定した内容を上書きはしない。
-function applyKnownLayout(found){
+// 既知の構成を当てはめる。force でなければ、手で設定した内容は上書きしない。
+function applyKnownLayout(found, force){
   const layout = KNOWN_LAYOUTS[hubSystemType];
-  if (!layout) return;
-  if (Object.keys(cfg.roles).some(k => cfg.roles[k] !== "none")) return;
+  if (!layout) return false;
+  if (!force && Object.keys(cfg.roles).some(k => cfg.roles[k] !== "none")) return false;
 
   const ports = [...layout.drive, layout.steer];
-  if (!ports.every(p => found.includes(p))) return;
+  if (found && !ports.every(p => found.includes(p))) return false;
 
+  for (const k of Object.keys(cfg.roles)) cfg.roles[k] = "none";
+  // 構成に含まれるポートだけ判定をやり直す。外れたポートは弾かれると分かっている。
+  for (const p of [...layout.drive, layout.steer]) badPorts.delete(p);
+  recentOutputs.length = 0;
   for (const p of layout.drive) cfg.roles[p] = "drive";
   cfg.roles[layout.steer] = "steer";
   save(); applyRoles(); renderPorts();
-  log(`${layout.name} の既定の構成を適用しました — ` +
+  log(`${layout.name} の確認済みの構成を適用しました — ` +
       `駆動: ${layout.drive.map(portLabel).join(", ")} / ステアリング: ${portLabel(layout.steer)}\n` +
       "  車体がその場で回る・前に進まない場合は、駆動の片方を「駆動（反転）」に変えてください。");
+  return true;
 }
+
+// モーターでないポートにモーター指令を送ると、ハブが接続を切ることがある。
+// 確認済みの構成から外れた割り当てを見つけたら知らせる。
+function checkLayout(){
+  const layout = KNOWN_LAYOUTS[hubSystemType];
+  $("applyLayoutBtn").disabled = !layout;
+  if (!layout) return;
+
+  const known = new Set([...layout.drive, layout.steer]);
+  const outside = Object.keys(cfg.roles)
+    .filter(k => cfg.roles[k] !== "none")
+    .map(Number)
+    .filter(p => !known.has(p));
+  if (!outside.length) return;
+
+  log(`⚠ ${layout.name} で確認されていないポートが割り当てられています: ${outside.map(portLabel).join(", ")}\n` +
+      `  確認済みの構成: 駆動 ${layout.drive.map(portLabel).join(", ")} / ステアリング ${portLabel(layout.steer)}\n` +
+      "  モーターでないポートにモーター指令を送ると、ハブが接続を切ることがあります。\n" +
+      "  「ポート割り当て」の下の「確認済みの構成を適用」を押すと直せます。");
+}
+
+$("applyLayoutBtn").addEventListener("click", () => {
+  if (!applyKnownLayout(null, true)){
+    log("この機種の確認済み構成は登録されていません。ポートスキャンで確かめてください。");
+  }
+});
 
 function logAssignment(){
   const drive = Object.keys(cfg.roles).filter(k => cfg.roles[k].startsWith("drive")).map(Number);
@@ -1267,6 +1330,7 @@ function logAssignment(){
 }
 
 function portUsable(p){
+  if (badPorts.has(p)) return false;
   return !notifyWorking || Object.keys(detected).length === 0 || !!detected[p];
 }
 
@@ -1461,6 +1525,7 @@ function scanPorts(){
 // テスト用の直接送信（キューのレート制限を通さず、確実に順番どおり送る）
 async function writeNow(bytes){
   if (!characteristic) return;
+  noteOutput(bytes);
   try {
     await writeRaw(bytes);
     txCount++;
