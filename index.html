@@ -302,6 +302,11 @@ function save(){
 let device = null, characteristic = null;
 let canWriteWithoutResponse = false, canWrite = true;
 let connected = false;
+let connecting = false;            // 接続シーケンス実行中
+let droppedDuringSetup = false;    // セットアップ中にハブ側から切断された
+let intentionalDisconnect = false; // 「切断」ボタンによる切断
+let autoReconnects = 0;            // 自動再接続の実行回数
+let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
 let testing = false;               // 診断テスト中は通常の制御出力を止める
@@ -394,7 +399,7 @@ async function drain(){
           if (consecutiveErrors === 1 || consecutiveErrors === 10){
             log("送信エラー: " + (e && e.message ? e.message : e));
           }
-          if (consecutiveErrors === 10) log(CONNECT_HELP);
+          if (consecutiveErrors === 10) log(HELP_NO_RESPONSE);
         }
       }
     }
@@ -543,13 +548,20 @@ function isTransientGattError(e){
          /in progress|already in progress|busy|GATT operation/i.test(msg);
 }
 
-async function withRetry(label, fn, attempts = 5, delay = 500){
+// GATT が切れてしまっている場合、同じ操作を繰り返しても永久に成功しない。
+// 接続からやり直す必要があるので、その判定を分ける。
+function isDisconnectedError(e){
+  return /disconnected|GATT Server is disconnected/i.test((e && e.message) || "") ||
+         !!(device && device.gatt && !device.gatt.connected);
+}
+
+async function withRetry(label, fn, attempts = 3, delay = 400){
   let lastErr;
   for (let i = 1; i <= attempts; i++){
     try { return await fn(); }
     catch (e){
       lastErr = e;
-      if (!isTransientGattError(e)) throw e;
+      if (!isTransientGattError(e) || isDisconnectedError(e)) throw e;
       log(`${label}: 一時エラーのため再試行 ${i}/${attempts} — ${e.message}`);
       await sleep(delay * i);
     }
@@ -557,18 +569,33 @@ async function withRetry(label, fn, attempts = 5, delay = 500){
   throw lastErr;
 }
 
-const CONNECT_HELP =
+const HELP_NO_RESPONSE =
   "書き込みがハブに届いていません。次を順に確認してください：\n" +
   "1. このページを開いた他のタブを全て閉じる（先に開いたタブが接続を保持し続けます）\n" +
   "2. LEGO 公式アプリなど、ハブに接続する他のアプリを終了する\n" +
-  "3. OS の Bluetooth 設定でハブを「ペアリング済み」にしない（登録済みなら削除する）\n" +
+  "3. OS の Bluetooth 設定にハブが登録されていたら削除する\n" +
   "4. ハブの電源を入れ直し、緑点滅の状態で接続し直す";
 
-async function openHub(){
-  log(`接続中: ${device.name || "(名前なし)"}`);
-  const server = await withRetry("GATT 接続", () => device.gatt.connect());
-  await sleep(600);                                   // 接続直後は落ち着くまで待つ
+const HELP_DROPPED =
+  "接続した直後にハブ側から切断されています。ほとんどは OS 側との競合です：\n" +
+  "1. Windows の「設定 → Bluetooth とデバイス」にハブがあれば「デバイスの削除」を実行する\n" +
+  "   （Powered Up ハブは OS に登録してはいけません。ブラウザの選択画面からだけ接続します）\n" +
+  "2. ハブの電源を切り、10 秒待ってから入れ直す\n" +
+  "3. 緑の点滅を確認したら、すぐに「接続」を押して選択画面も素早く確定する\n" +
+  "   （点滅が終わって待ち受けが切れると、接続してもすぐ落ちます）\n" +
+  "4. ハブの電池が消耗していないか確認する（電圧不足でも接続直後に落ちます）";
 
+// 接続からハンドシェイクまでを 1 回分の試行として実行する。
+// 途中でハブに切断された場合は、この関数全体をやり直す必要がある。
+async function connectOnce(){
+  if (device.gatt.connected){
+    device.gatt.disconnect();
+    await sleep(400);                 // OS が接続を解放するのを待つ
+  }
+  const server = await device.gatt.connect();
+
+  // ここで待たない。LEGO ハブは接続後に何もしないと切ってしまうことがあるので、
+  // 探索と購読をできるだけ早く済ませる。
   const service = await withRetry("サービス取得", () => server.getPrimaryService(LWP3_SERVICE));
   characteristic = await withRetry("キャラクタリスティック取得", () => service.getCharacteristic(LWP3_CHAR));
 
@@ -583,6 +610,7 @@ async function openHub(){
     characteristic.removeEventListener("characteristicvaluechanged", onNotify);
     characteristic.addEventListener("characteristicvaluechanged", onNotify);
   } catch (e){
+    if (isDisconnectedError(e)) throw e;
     log("通知の購読に失敗（角度フィードバックなしで続行）: " + e.message);
   }
 
@@ -597,20 +625,44 @@ async function openHub(){
   applyRoles();
   requestWakeLock();
 
-  // ハンドシェイク: 機種 ID を要求し、応答が返ることで通信の成立を確認する。
-  // ここで応答がなければ、その先の操作は全て無駄なので早めに知らせる。
-  const ok = await handshake();
-  if (ok){
-    queueCommand("battery", CMD_BATTERY_SUB, true);
-    setTimeout(() => {
-      if (connected && Object.keys(detected).length === 0){
-        log("⚠ モーターが 1 つも検出されていません。診断の「ポートスキャン」でどのポートが動くか確認してください。");
+  // 機種 ID を要求し、応答が返ることで通信の成立を確認する。
+  if (!await handshake()) throw new Error("ハブが応答しません");
+  return true;
+}
+
+async function openHub(){
+  connecting = true;
+  droppedDuringSetup = false;
+  intentionalDisconnect = false;
+  try {
+    for (let attempt = 1; attempt <= 4; attempt++){
+      log(attempt === 1
+        ? `接続中: ${device.name || "(名前なし)"}`
+        : `接続をやり直します (${attempt}/4)…`);
+      droppedDuringSetup = false;
+      try {
+        await connectOnce();
+        autoReconnects = 0;
+        queueCommand("battery", CMD_BATTERY_SUB, true);
+        const gen = ++connectGen;
+        setTimeout(() => {
+          if (gen === connectGen && connected && Object.keys(detected).length === 0){
+            log("⚠ モーターが 1 つも検出されていません。診断の「ポートスキャン」でどのポートが動くか確認してください。");
+          }
+        }, 2000);
+        return true;
+      } catch (e){
+        connected = false;
+        log(`接続に失敗 (${attempt}/4): ${(e && e.message) || e}`);
+        if (attempt < 4) await sleep(700 * attempt);
       }
-    }, 2000);
-  } else {
-    log("⚠ ハブが応答しません。\n" + CONNECT_HELP);
+    }
+    log("⚠ 接続できませんでした。\n" + (droppedDuringSetup ? HELP_DROPPED : HELP_NO_RESPONSE));
+    setConnUI(false);
+    return false;
+  } finally {
+    connecting = false;
   }
-  return ok;
 }
 
 async function handshake(){
@@ -652,7 +704,6 @@ $("connectBtn").addEventListener("click", async () => {
       log("デバイス選択がキャンセルされました");
     } else {
       log("接続失敗: " + (e && e.message ? e.message : e));
-      if (isTransientGattError(e)) log(CONNECT_HELP);
     }
     setConnUI(false);
   }
@@ -663,11 +714,6 @@ $("reconnectBtn").addEventListener("click", async () => {
   if (!device){ log("先に一度「LEGO Hub に接続」を実行してください"); return; }
   $("reconnectBtn").disabled = true;
   try {
-    if (device.gatt.connected){
-      log("いったん切断します…");
-      device.gatt.disconnect();
-      await sleep(1200);            // OS 側が接続を解放するのを待つ
-    }
     await openHub();
   } catch (e){
     log("再接続に失敗: " + (e && e.message ? e.message : e));
@@ -678,14 +724,30 @@ $("reconnectBtn").addEventListener("click", async () => {
 });
 
 $("disconnectBtn").addEventListener("click", async () => {
+  intentionalDisconnect = true;
   stopAll();
   setTimeout(() => { if (device && device.gatt.connected) device.gatt.disconnect(); }, 150);
 });
 
 function onDisconnected(){
-  connected = false; characteristic = null; pending.clear();
+  characteristic = null; pending.clear();
+  if (connecting){
+    // セットアップ中の切断。openHub 側が接続からやり直すので、ここでは記録だけ。
+    droppedDuringSetup = true;
+    log("ハブが接続を切りました（セットアップ中）");
+    return;
+  }
+  connected = false;
   setConnUI(false);
   log("ハブとの接続が切れました");
+
+  // 意図しない切断なら一度だけ自動で張り直す。
+  // ハブが接続直後に落とす個体・環境があるため。
+  if (!intentionalDisconnect && device && autoReconnects < 2){
+    autoReconnects++;
+    log(`自動で再接続します (${autoReconnects}/2)…`);
+    setTimeout(() => { if (device && !device.gatt.connected && !connecting) openHub(); }, 1000);
+  }
 }
 
 function setConnUI(on){
