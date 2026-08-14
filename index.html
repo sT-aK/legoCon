@@ -74,6 +74,7 @@
   <h2>1. 接続</h2>
   <div class="row">
     <button id="connectBtn">LEGO Hub に接続</button>
+    <button id="reconnectBtn" class="ghost" disabled>再接続</button>
     <button id="disconnectBtn" class="ghost" disabled>切断</button>
   </div>
   <div style="margin-top:12px">
@@ -100,33 +101,23 @@
     <div class="bar center"><i id="strBar"></i></div>
   </div>
 
-  <details style="margin-top:12px">
-    <summary>入力の割り当てと生の値を表示</summary>
-    <div class="grid" style="margin-top:10px">
-      <div>
-        <label>アクセル入力</label>
-        <select id="cfgThrottleSrc">
-          <option value="triggers">RT / LT トリガー</option>
-          <option value="axisY">スティック縦軸</option>
-        </select>
-      </div>
-      <div>
-        <label>RT の button 番号</label>
-        <input type="number" id="cfgRt" min="0" max="31" step="1">
-      </div>
-      <div>
-        <label>LT の button 番号</label>
-        <input type="number" id="cfgLt" min="0" max="31" step="1">
-      </div>
-      <div>
-        <label>アクセル軸 (縦) の axis 番号</label>
-        <input type="number" id="cfgThrAxis" min="0" max="15" step="1">
-      </div>
-      <div>
-        <label>ステアリング軸の axis 番号</label>
-        <input type="number" id="cfgStrAxis" min="0" max="15" step="1">
-      </div>
+  <div id="mapWarn" class="warnbox" style="margin:12px 0 0" hidden></div>
+
+  <div style="margin-top:14px">
+    <label>入力の割り当て</label>
+    <div class="kv"><span>アクセル</span><span id="mapAccel" class="mono">—</span></div>
+    <div class="kv"><span>ブレーキ / 後退</span><span id="mapBrake" class="mono">—</span></div>
+    <div class="kv"><span>ステアリング</span><span id="mapSteer" class="mono">—</span></div>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost" data-learn="accel">アクセルを学習</button>
+      <button class="ghost" data-learn="brake">ブレーキを学習</button>
+      <button class="ghost" data-learn="steer">ステアリングを学習</button>
     </div>
+    <div id="learnMsg" class="note" style="min-height:1.6em"></div>
+  </div>
+
+  <details style="margin-top:12px">
+    <summary>生の入力値を表示</summary>
     <div class="note mono" id="rawAxes" style="margin-top:10px">axes: —</div>
     <div class="note mono" id="rawButtons">buttons: —</div>
   </details>
@@ -276,7 +267,13 @@ const IO_TYPES = {
    設定（localStorage に保存）
    ============================================================ */
 const DEFAULTS = {
-  throttleSrc:"triggers", rtIndex:7, ltIndex:6, thrAxis:1, strAxis:0,
+  // 標準マッピングの Xbox コントローラーの既定値。
+  // 「Unknown Gamepad」と表示される環境では番号が違うので、学習機能で上書きする。
+  map: {
+    accel: { kind:"button", index:7, rest:0, dir:1, span:1 },
+    brake: { kind:"button", index:6, rest:0, dir:1, span:1 },
+    steer: { kind:"axis",   index:0, rest:0, dir:1, span:1 },
+  },
   driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
   steerMode:"position", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
@@ -289,8 +286,10 @@ function load(){
     const raw = localStorage.getItem("legocon.cfg");
     if (!raw) return clone(DEFAULTS);
     const saved = JSON.parse(raw);
-    return Object.assign(clone(DEFAULTS), saved,
-      { roles: Object.assign({}, DEFAULTS.roles, saved.roles || {}) });
+    return Object.assign(clone(DEFAULTS), saved, {
+      roles: Object.assign({}, DEFAULTS.roles, saved.roles || {}),
+      map: Object.assign(clone(DEFAULTS.map), saved.map || {}),
+    });
   } catch { return clone(DEFAULTS); }
 }
 function save(){
@@ -304,7 +303,7 @@ let device = null, characteristic = null;
 let canWriteWithoutResponse = false, canWrite = true;
 let connected = false;
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
-let txCount = 0, errCount = 0, rxCount = 0;
+let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
 let testing = false;               // 診断テスト中は通常の制御出力を止める
 let steerPort = null;              // 現在ステアリングに割り当てられているポート番号
 let steerCenter = null;            // センターとみなす角度（POS カウンタ値）
@@ -314,6 +313,7 @@ const detected = {};               // portId -> デバイス名
 const lastSent = {};               // key -> { value, time }
 
 const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const logLines = [];
 function log(msg){
@@ -379,10 +379,23 @@ async function drain(){
       try {
         await writeRaw(bytes);
         txCount++;
+        consecutiveErrors = 0;
         if (cfg.hexLog) log("TX " + hex(bytes));
       } catch (e){
-        errCount++;
-        if (errCount % 20 === 1) log("送信エラー: " + (e && e.message ? e.message : e));
+        // 一時エラーは 1 回だけ即時リトライする。連続で失敗するようなら
+        // リンクが壊れているので、リトライで詰まらせずに諦める。
+        let recovered = false;
+        if (isTransientGattError(e) && consecutiveErrors < 5){
+          await sleep(120);
+          try { await writeRaw(bytes); txCount++; consecutiveErrors = 0; recovered = true; } catch {}
+        }
+        if (!recovered){
+          errCount++; consecutiveErrors++;
+          if (consecutiveErrors === 1 || consecutiveErrors === 10){
+            log("送信エラー: " + (e && e.message ? e.message : e));
+          }
+          if (consecutiveErrors === 10) log(CONNECT_HELP);
+        }
       }
     }
   } finally {
@@ -521,6 +534,104 @@ function subscribeSteer(){
 /* ============================================================
    接続 / 切断
    ============================================================ */
+// Chrome は GATT 接続が完全に落ち着く前に connect() を解決させることがあり、
+// 直後の操作が NetworkError「Connection already in progress」で弾かれる。
+// 一時的な失敗なので、間を置いて再試行すれば通る。
+function isTransientGattError(e){
+  const msg = (e && e.message) || "";
+  return (e && e.name === "NetworkError") ||
+         /in progress|already in progress|busy|GATT operation/i.test(msg);
+}
+
+async function withRetry(label, fn, attempts = 5, delay = 500){
+  let lastErr;
+  for (let i = 1; i <= attempts; i++){
+    try { return await fn(); }
+    catch (e){
+      lastErr = e;
+      if (!isTransientGattError(e)) throw e;
+      log(`${label}: 一時エラーのため再試行 ${i}/${attempts} — ${e.message}`);
+      await sleep(delay * i);
+    }
+  }
+  throw lastErr;
+}
+
+const CONNECT_HELP =
+  "書き込みがハブに届いていません。次を順に確認してください：\n" +
+  "1. このページを開いた他のタブを全て閉じる（先に開いたタブが接続を保持し続けます）\n" +
+  "2. LEGO 公式アプリなど、ハブに接続する他のアプリを終了する\n" +
+  "3. OS の Bluetooth 設定でハブを「ペアリング済み」にしない（登録済みなら削除する）\n" +
+  "4. ハブの電源を入れ直し、緑点滅の状態で接続し直す";
+
+async function openHub(){
+  log(`接続中: ${device.name || "(名前なし)"}`);
+  const server = await withRetry("GATT 接続", () => device.gatt.connect());
+  await sleep(600);                                   // 接続直後は落ち着くまで待つ
+
+  const service = await withRetry("サービス取得", () => server.getPrimaryService(LWP3_SERVICE));
+  characteristic = await withRetry("キャラクタリスティック取得", () => service.getCharacteristic(LWP3_CHAR));
+
+  const props = characteristic.properties;
+  canWriteWithoutResponse =
+    !!(props && props.writeWithoutResponse) &&
+    typeof characteristic.writeValueWithoutResponse === "function";
+  canWrite = !props || !!props.write;
+
+  try {
+    await withRetry("通知の購読", () => characteristic.startNotifications());
+    characteristic.removeEventListener("characteristicvaluechanged", onNotify);
+    characteristic.addEventListener("characteristicvaluechanged", onNotify);
+  } catch (e){
+    log("通知の購読に失敗（角度フィードバックなしで続行）: " + e.message);
+  }
+
+  connected = true; armed = false;
+  steerCenter = null; steerActual = null;
+  txCount = 0; errCount = 0; rxCount = 0; consecutiveErrors = 0;
+  setConnUI(true);
+  $("hubName").textContent = device.name || "(名前なし)";
+  log(`接続完了 — 書き込み方式: ${cfg.writeMode === "without" ? "応答なし" : "応答あり"}`
+      + ` (対応: ${canWrite ? "write" : "-"}/${canWriteWithoutResponse ? "writeWithoutResponse" : "-"})`);
+
+  applyRoles();
+  requestWakeLock();
+
+  // ハンドシェイク: 機種 ID を要求し、応答が返ることで通信の成立を確認する。
+  // ここで応答がなければ、その先の操作は全て無駄なので早めに知らせる。
+  const ok = await handshake();
+  if (ok){
+    queueCommand("battery", CMD_BATTERY_SUB, true);
+    setTimeout(() => {
+      if (connected && Object.keys(detected).length === 0){
+        log("⚠ モーターが 1 つも検出されていません。診断の「ポートスキャン」でどのポートが動くか確認してください。");
+      }
+    }, 2000);
+  } else {
+    log("⚠ ハブが応答しません。\n" + CONNECT_HELP);
+  }
+  return ok;
+}
+
+async function handshake(){
+  for (let i = 1; i <= 3; i++){
+    const before = rxCount;
+    try {
+      await writeRaw(cmdHubProperty(0x0B));
+    } catch (e){
+      log(`ハンドシェイク送信に失敗 (${i}/3): ${e.message}`);
+      await sleep(500);
+      continue;
+    }
+    for (let t = 0; t < 20; t++){
+      await sleep(50);
+      if (rxCount > before) return true;
+    }
+    log(`ハブからの応答待ちがタイムアウトしました (${i}/3)`);
+  }
+  return false;
+}
+
 $("connectBtn").addEventListener("click", async () => {
   if (!navigator.bluetooth){
     alert("このブラウザは Web Bluetooth に対応していません。iOS では Bluefy、PC では Chrome / Edge をお使いください。");
@@ -533,58 +644,36 @@ $("connectBtn").addEventListener("click", async () => {
       filters: [{ services: [LWP3_SERVICE] }],
       optionalServices: [LWP3_SERVICE],
     });
+    device.removeEventListener("gattserverdisconnected", onDisconnected);
     device.addEventListener("gattserverdisconnected", onDisconnected);
-
-    log(`接続中: ${device.name || "(名前なし)"}`);
-    const server = await device.gatt.connect();
-    const service = await server.getPrimaryService(LWP3_SERVICE);
-    characteristic = await service.getCharacteristic(LWP3_CHAR);
-
-    const props = characteristic.properties;
-    canWriteWithoutResponse =
-      !!(props && props.writeWithoutResponse) &&
-      typeof characteristic.writeValueWithoutResponse === "function";
-    canWrite = !props || !!props.write;
-
-    try {
-      await characteristic.startNotifications();
-      characteristic.addEventListener("characteristicvaluechanged", onNotify);
-    } catch (e){
-      log("通知の購読に失敗（角度フィードバックなしで続行）: " + e.message);
-    }
-
-    connected = true; armed = false;
-    steerCenter = null; steerActual = null;
-    txCount = 0; errCount = 0; rxCount = 0;
-    setConnUI(true);
-    $("hubName").textContent = device.name || "(名前なし)";
-    log(`接続完了 — 書き込み方式: ${cfg.writeMode === "without" ? "応答なし" : "応答あり"}`
-        + ` (対応: ${canWrite ? "write" : "-"}/${canWriteWithoutResponse ? "writeWithoutResponse" : "-"})`);
-
-    queueCommand("battery", CMD_BATTERY_SUB, true);
-    queueCommand("prop0b", cmdHubProperty(0x0B), true);   // 機種 ID
-    applyRoles();
-    requestWakeLock();
-
-    // ハブは接続直後に必ず接続済みデバイスを通知してくる。
-    // 何も届かない = 受信経路が働いていない、という切り分けになる。
-    setTimeout(() => {
-      if (!connected) return;
-      if (rxCount === 0){
-        log("⚠ ハブから 1 件も応答がありません。診断の「ハブ情報を要求」を試してください。");
-      } else if (Object.keys(detected).length === 0){
-        log("⚠ モーターが 1 つも検出されていません。ポート割り当てを手動で設定するか、ポートスキャンで確認してください。");
-      }
-    }, 2500);
-
+    await openHub();
   } catch (e){
     if (e && (e.name === "NotFoundError" || e.name === "AbortError")){
       log("デバイス選択がキャンセルされました");
     } else {
       log("接続失敗: " + (e && e.message ? e.message : e));
-      alert("接続に失敗しました: " + (e && e.message ? e.message : e));
+      if (isTransientGattError(e)) log(CONNECT_HELP);
     }
     setConnUI(false);
+  }
+});
+
+// 一度選んだデバイスには、選択ダイアログを出さずに接続し直せる。
+$("reconnectBtn").addEventListener("click", async () => {
+  if (!device){ log("先に一度「LEGO Hub に接続」を実行してください"); return; }
+  $("reconnectBtn").disabled = true;
+  try {
+    if (device.gatt.connected){
+      log("いったん切断します…");
+      device.gatt.disconnect();
+      await sleep(1200);            // OS 側が接続を解放するのを待つ
+    }
+    await openHub();
+  } catch (e){
+    log("再接続に失敗: " + (e && e.message ? e.message : e));
+    setConnUI(false);
+  } finally {
+    $("reconnectBtn").disabled = false;
   }
 });
 
@@ -603,6 +692,7 @@ function setConnUI(on){
   connected = on;
   $("connectBtn").disabled = on;
   $("disconnectBtn").disabled = !on;
+  $("reconnectBtn").disabled = !device;
   $("calibBtn").disabled = !on;
   for (const id of ["pingBtn", "scanBtn", "testBtn"]) $(id).disabled = !on;
   const s = $("btState");
@@ -680,7 +770,10 @@ addEventListener("keydown", e => {
 });
 addEventListener("keyup", e => keys.delete(e.code));
 
-addEventListener("gamepadconnected", e => log(`コントローラー検出: ${e.gamepad.id}`));
+addEventListener("gamepadconnected", e => {
+  mapWarned = false;
+  log(`コントローラー検出: ${e.gamepad.id} (mapping: ${e.gamepad.mapping || "非標準"})`);
+});
 addEventListener("gamepaddisconnected", e => { log("コントローラー切断"); stopAll(); });
 
 function getPad(){
@@ -697,6 +790,79 @@ function axisValue(pad, i){
   const a = pad.axes[i];
   return typeof a === "number" ? a : 0;
 }
+// 学習した割り当てに従って 1 つの入力を読む。
+// unipolar: 0〜1（トリガー用） / bipolar: -1〜1（スティック用）
+function readControl(pad, m, bipolar){
+  if (!pad || !m) return 0;
+  const raw = m.kind === "axis" ? axisValue(pad, m.index) : btnValue(pad, m.index);
+  const v = (raw - m.rest) * m.dir / (m.span || 1);
+  return bipolar ? Math.max(-1, Math.min(1, v)) : Math.max(0, Math.min(1, v));
+}
+
+function describeMap(m){
+  if (!m) return "—";
+  const dir = m.dir < 0 ? " 反転" : "";
+  return `${m.kind === "axis" ? "axis" : "button"}[${m.index}]${dir}`;
+}
+function renderMap(){
+  $("mapAccel").textContent = describeMap(cfg.map.accel);
+  $("mapBrake").textContent = describeMap(cfg.map.brake);
+  $("mapSteer").textContent = describeMap(cfg.map.steer);
+}
+
+// 3 秒間サンプリングして、最も大きく動いた軸／ボタンをその操作に割り当てる。
+const LEARN_LABELS = { accel:"アクセル（前進）", brake:"ブレーキ（後退）", steer:"ステアリング（右いっぱい）" };
+let learning = false;
+
+async function learnControl(which){
+  if (learning) return;
+  const pad = getPad();
+  if (!pad){
+    $("learnMsg").textContent = "コントローラーが検出されていません。ボタンを 1 回押してから、もう一度お試しください。";
+    return;
+  }
+  learning = true;
+  try {
+    const base = { axes: Array.from(pad.axes, Number), buttons: pad.buttons.map((_, i) => btnValue(pad, i)) };
+    const best = { kind:null, index:-1, dev:0 };
+
+    for (let t = 3000; t > 0; t -= 50){
+      $("learnMsg").textContent = `${LEARN_LABELS[which]} をいっぱいまで動かしてください… ${(t/1000).toFixed(1)} 秒`;
+      await sleep(50);
+      const p = getPad();
+      if (!p) continue;
+      for (let i = 0; i < base.axes.length; i++){
+        const dev = axisValue(p, i) - base.axes[i];
+        if (Math.abs(dev) > Math.abs(best.dev)){ best.kind = "axis"; best.index = i; best.dev = dev; }
+      }
+      for (let i = 0; i < base.buttons.length; i++){
+        const dev = btnValue(p, i) - base.buttons[i];
+        if (Math.abs(dev) > Math.abs(best.dev)){ best.kind = "button"; best.index = i; best.dev = dev; }
+      }
+    }
+
+    if (!best.kind || Math.abs(best.dev) < 0.3){
+      $("learnMsg").textContent = "入力を検出できませんでした。操作しながらもう一度お試しください。";
+      return;
+    }
+    const rest = best.kind === "axis" ? base.axes[best.index] : base.buttons[best.index];
+    cfg.map[which] = {
+      kind: best.kind, index: best.index, rest,
+      dir: Math.sign(best.dev),
+      span: Math.max(0.2, Math.abs(best.dev)),
+    };
+    save(); renderMap();
+    $("learnMsg").textContent = `${LEARN_LABELS[which]} を ${describeMap(cfg.map[which])} に割り当てました。`;
+    log(`入力学習: ${which} → ${describeMap(cfg.map[which])} (rest ${rest.toFixed(2)}, span ${cfg.map[which].span.toFixed(2)})`);
+  } finally {
+    learning = false;
+  }
+}
+
+for (const btn of document.querySelectorAll("[data-learn]")){
+  btn.addEventListener("click", () => learnControl(btn.dataset.learn));
+}
+
 function shape(x){
   const dz = cfg.deadzone / 100;
   const a = Math.abs(x);
@@ -710,7 +876,7 @@ function shape(x){
 /* ============================================================
    制御ループ
    ============================================================ */
-let lastDrive = null, lastSteer = null, bPrev = false;
+let lastDrive = null, lastSteer = null, bPrev = false, mapWarned = false;
 
 function loop(){
   const pad = getPad();
@@ -721,13 +887,20 @@ function loop(){
     $("padState").className = "pill on";
     $("padId").textContent = pad.id;
     $("padHint").hidden = true;
-
-    if (cfg.throttleSrc === "triggers"){
-      throttle = btnValue(pad, cfg.rtIndex) - btnValue(pad, cfg.ltIndex);
-    } else {
-      throttle = -axisValue(pad, cfg.thrAxis);   // 上倒し = 前進
+    if (!mapWarned){
+      mapWarned = true;
+      if (pad.mapping !== "standard"){
+        $("mapWarn").hidden = false;
+        $("mapWarn").innerHTML =
+          "<strong>標準マッピングとして認識されていません。</strong>" +
+          "ボタン番号がブラウザ既定と異なるため、下の「アクセルを学習」「ブレーキを学習」「ステアリングを学習」を" +
+          "順に実行して割り当て直してください。";
+        log(`ゲームパッドのマッピング: "${pad.mapping || "(なし)"}" — 入力の学習が必要です`);
+      }
     }
-    steer = axisValue(pad, cfg.strAxis);
+
+    throttle = readControl(pad, cfg.map.accel, false) - readControl(pad, cfg.map.brake, false);
+    steer = readControl(pad, cfg.map.steer, true);
 
     const bNow = btnValue(pad, 1) > 0.5;         // B ボタン（押した瞬間だけ反応）
     if (bNow && !bPrev) stopAll();
@@ -857,15 +1030,6 @@ function updateRawDebug(pad){
 /* ============================================================
    設定 UI のバインド
    ============================================================ */
-function bindNumber(id, key){
-  const el = $(id);
-  el.value = cfg[key];
-  el.addEventListener("change", () => {
-    const v = parseInt(el.value, 10);
-    if (!Number.isNaN(v)){ cfg[key] = v; save(); }
-    el.value = cfg[key];
-  });
-}
 function bindRange(id, key, labelId, fmt){
   const el = $(id), lb = $(labelId);
   el.value = cfg[key];
@@ -874,20 +1038,12 @@ function bindRange(id, key, labelId, fmt){
   upd();
 }
 
-bindNumber("cfgRt", "rtIndex");
-bindNumber("cfgLt", "ltIndex");
-bindNumber("cfgThrAxis", "thrAxis");
-bindNumber("cfgStrAxis", "strAxis");
-
 bindRange("cfgMaxPower", "maxPower", "lblMaxPower", v => v + " %");
 bindRange("cfgDeadzone", "deadzone", "lblDeadzone", v => v + " %");
 bindRange("cfgExpo", "expo", "lblExpo", v => v + " %");
 bindRange("cfgSteerAngle", "steerAngle", "lblSteerAngle", v => "±" + v + " °");
 bindRange("cfgSteerPower", "steerPower", "lblSteerPower", v => v + " %");
 bindRange("cfgTrim", "trim", "lblTrim", v => v + " °");
-
-$("cfgThrottleSrc").value = cfg.throttleSrc;
-$("cfgThrottleSrc").addEventListener("change", e => { cfg.throttleSrc = e.target.value; save(); });
 
 $("cfgSteerMode").value = cfg.steerMode;
 $("cfgSteerMode").addEventListener("change", e => {
@@ -923,7 +1079,6 @@ $("calibBtn").addEventListener("click", () => {
 /* ============================================================
    診断
    ============================================================ */
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 const TEST_PORTS = [0, 1, 2, 3, 4, 5];
 const testPortName = p => PORT_NAMES[p] || String.fromCharCode(65 + p);
 
@@ -1029,6 +1184,7 @@ async function requestWakeLock(){
 
 envCheck();
 renderPorts();
+renderMap();
 applyRoles();
 log("準備完了。コントローラーのボタンを押してから「LEGO Hub に接続」をタップしてください。");
 requestAnimationFrame(loop);
