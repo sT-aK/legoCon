@@ -320,6 +320,8 @@ let connectGen = 0;                // 接続の世代（古いタイマーの発
 let notifyWorking = false;         // ハブからの通知が受け取れているか
 let lastGotoTime = 0;              // 直近に角度指令を送った時刻
 let steerNeedsSub = true;          // 舵角の購読がまだなら true
+let scanCurrentPort = null;        // ポートスキャンで今試しているポート
+const scanRejected = new Set();    // 指令を拒否したポート
 let holdTest = false;              // 接続保持テストの実行中
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
@@ -558,6 +560,7 @@ function onNotify(event){
       0x07:"過電流", 0x08:"内部エラー",
     };
     log(`ハブがエラーを返しました: command 0x${d[3].toString(16)} → ${codes[d[4]] || "0x" + d[4].toString(16)}`);
+    if (d[3] === 0x81 && scanCurrentPort !== null) scanRejected.add(scanCurrentPort);
 
     if (d[3] === 0x81 && cfg.steerMode === "position" && performance.now() - lastGotoTime < 800){
       cfg.steerMode = "power";
@@ -1470,14 +1473,27 @@ $("scanBtn").addEventListener("click", async () => {
   testing = true;
   $("scanBtn").disabled = true;
   log("ポートスキャン開始 — どのポートで何が動くか見てください");
+  scanRejected.clear();
+  const tried = [];
   try {
     for (const p of scanPorts()){
+      if (!connected){ log("⚠ 接続が切れたためスキャンを中断しました"); break; }
       log(`ポート ${portLabel(p)} を +50% で 0.6 秒…`);
+      scanCurrentPort = p;
+      tried.push(p);
       await pulsePort(p, 50, 600);
-      await sleep(400);
+      await sleep(400);            // エラー通知が返るのを待ってから次へ
+      scanCurrentPort = null;
     }
-    log("ポートスキャン終了");
+    const accepted = tried.filter(p => !scanRejected.has(p));
+    const rejected = tried.filter(p => scanRejected.has(p));
+    log("ポートスキャン終了\n" +
+        `  指令を受理したポート: ${accepted.length ? accepted.map(portLabel).join(", ") : "なし"}\n` +
+        `  拒否したポート: ${rejected.length ? rejected.map(portLabel).join(", ") : "なし"}\n` +
+        "  受理したポートのうち、実際に車輪が回ったものを「駆動」、\n" +
+        "  ステアリングが左右に振れたものを「ステアリング」に割り当ててください。");
   } finally {
+    scanCurrentPort = null;
     testing = false;
     $("scanBtn").disabled = !connected;
     lastDrive = null; lastSteer = null;
