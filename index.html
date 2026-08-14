@@ -410,6 +410,7 @@ async function drain(){
           try { await writeRaw(bytes); txCount++; consecutiveErrors = 0; recovered = true; } catch {}
         }
         if (!recovered){
+          noteGattError(e);
           errCount++; consecutiveErrors++;
           if (consecutiveErrors === 1 || consecutiveErrors === 10){
             log("送信エラー: " + (e && e.message ? e.message : e));
@@ -565,6 +566,14 @@ function isTransientGattError(e){
 
 // GATT が切れてしまっている場合、同じ操作を繰り返しても永久に成功しない。
 // 接続からやり直す必要があるので、その判定を分ける。
+// 「接続処理が進行中」は他の誰かがハブを保持しているサイン。
+// 最後に出す案内を選ぶために記録しておく。
+let sawInProgress = false;
+function noteGattError(e){
+  if (/already in progress/i.test((e && e.message) || "")) sawInProgress = true;
+  return e;
+}
+
 function isDisconnectedError(e){
   return /disconnected|GATT Server is disconnected/i.test((e && e.message) || "") ||
          !!(device && device.gatt && !device.gatt.connected);
@@ -591,6 +600,19 @@ const HELP_NO_RESPONSE =
   "3. OS の Bluetooth 設定にハブが登録されていたら削除する\n" +
   "4. ハブの電源を入れ直し、緑点滅の状態で接続し直す";
 
+const HELP_IN_PROGRESS =
+  "ブラウザが「このデバイスへの接続処理が既に進行中」と言っています。\n" +
+  "ハブへの接続を他の誰かが保持している状態です。順に確認してください：\n" +
+  "1. edge://bluetooth-internals（chrome://bluetooth-internals）のタブを閉じる\n" +
+  "   ※ そこで Connect したままだとハブを占有し続けます。必ず Disconnect してから閉じる\n" +
+  "2. このページを開いている他のタブを全て閉じ、1 枚だけにする\n" +
+  "3. PowerShell（管理者）で Windows がハブを登録していないか確認する：\n" +
+  "     Get-PnpDevice -Class BTHLEDevice | Format-Table FriendlyName, Status, InstanceId\n" +
+  "   Technic Move が出てきたら削除する：\n" +
+  "     Get-PnpDevice -Class BTHLEDevice | Where-Object FriendlyName -like '*Technic*' |\n" +
+  "       ForEach-Object { pnputil /remove-device $_.InstanceId }\n" +
+  "4. Bluetooth を一度オフ→オンにする。それでも駄目ならブラウザを完全に終了して開き直す";
+
 const HELP_DROPPED =
   "接続した直後にハブ側から切断されています。ほとんどは OS 側との競合です：\n" +
   "1. Windows の「設定 → Bluetooth とデバイス」にハブがあれば「デバイスの削除」を実行する\n" +
@@ -602,20 +624,35 @@ const HELP_DROPPED =
 
 // 接続からハンドシェイクまでを 1 回分の試行として実行する。
 // 途中でハブに切断された場合は、この関数全体をやり直す必要がある。
-async function connectOnce(){
+async function trySubscribe(){
+  try {
+    await gattOp(() => characteristic.startNotifications());
+    characteristic.removeEventListener("characteristicvaluechanged", onNotify);
+    characteristic.addEventListener("characteristicvaluechanged", onNotify);
+    return true;
+  } catch (e){
+    noteGattError(e);
+    if (isDisconnectedError(e)) throw e;
+    log("通知の購読に失敗: " + e.message);
+    return false;
+  }
+}
+
+async function connectOnce(attempt){
   // 前の接続が残っていると次の connect() が "Connection already in progress" になる。
-  // 切断済みに見えてもブラウザ側の後始末が終わっていないことがあるので、必ず一度切ってから待つ。
+  // 切断済みに見えてもブラウザ側の後始末が終わっていないことがあるので、
+  // 必ず一度切って待つ。待ち時間は回を追うごとに長くする。
   selfDisconnect = true;
   try { device.gatt.disconnect(); } catch {}
-  await sleep(600);
+  await sleep(600 * attempt);
   selfDisconnect = false;
 
   const server = await device.gatt.connect();
 
-  // 接続後に待たない。LEGO ハブは無操作の時間があると切ってしまうことがあるので、
-  // 探索と購読をできるだけ早く済ませる。
-  const service = await withRetry("サービス取得", () => gattOp(() => server.getPrimaryService(LWP3_SERVICE)));
-  characteristic = await withRetry("キャラクタリスティック取得", () => gattOp(() => service.getCharacteristic(LWP3_CHAR)));
+  // 接続後は一切待たない。ハブは最初の通信までが長いと接続を切ってしまうため、
+  // 探索 → 購読 → 書き込みを最短で通す。
+  const service = await gattOp(() => server.getPrimaryService(LWP3_SERVICE));
+  characteristic = await gattOp(() => service.getCharacteristic(LWP3_CHAR));
 
   const props = characteristic.properties;
   canWriteWithoutResponse =
@@ -623,23 +660,25 @@ async function connectOnce(){
     typeof characteristic.writeValueWithoutResponse === "function";
   canWrite = !props || !!props.write;
 
-  try {
-    await withRetry("通知の購読", () => gattOp(() => characteristic.startNotifications()), 2, 800);
-    characteristic.removeEventListener("characteristicvaluechanged", onNotify);
-    characteristic.addEventListener("characteristicvaluechanged", onNotify);
-  } catch (e){
-    if (isDisconnectedError(e)) throw e;
-    log("通知の購読に失敗（角度フィードバックなしで続行）: " + e.message);
-  }
-
   armed = false;
   steerCenter = null; steerActual = null;
   txCount = 0; errCount = 0; rxCount = 0; consecutiveErrors = 0;
 
+  // 通知の購読はここで 1 回だけ試す。粘ると最初の書き込みまでが遅れ、
+  // その間にハブが接続を切ってしまう。
+  let notifyOk = await trySubscribe();
+
   // 機種 ID を要求し、応答が返ることで通信の成立を確認する。
   // ここを通るまで connected を立てない。立てると制御ループが書き込みを始めてしまい、
   // ハンドシェイクの書き込みと GATT 操作が衝突する。
-  const result = await handshake();
+  let result = await handshake();
+
+  // 書き込みは通っているのに応答がない場合だけ、購読をもう一度試して確認し直す。
+  if (result === "write-only" && !notifyOk){
+    notifyOk = await trySubscribe();
+    if (notifyOk) result = await handshake();
+  }
+
   if (result === "fail") throw new Error("ハブに書き込めません");
   notifyWorking = (result === "ok");
 
@@ -664,6 +703,7 @@ async function openHub(){
   connecting = true;
   droppedDuringSetup = false;
   intentionalDisconnect = false;
+  sawInProgress = false;
   try {
     for (let attempt = 1; attempt <= 4; attempt++){
       log(attempt === 1
@@ -671,7 +711,7 @@ async function openHub(){
         : `接続をやり直します (${attempt}/4)…`);
       droppedDuringSetup = false;
       try {
-        await connectOnce();
+        await connectOnce(attempt);
         autoReconnects = 0;
         queueCommand("battery", CMD_BATTERY_SUB, true);
         const gen = ++connectGen;
@@ -682,12 +722,14 @@ async function openHub(){
         }, 2000);
         return true;
       } catch (e){
+        noteGattError(e);
         connected = false;
         log(`接続に失敗 (${attempt}/4): ${(e && e.message) || e}`);
         if (attempt < 4) await sleep(1000 * attempt);
       }
     }
-    log("⚠ 接続できませんでした。\n" + (droppedDuringSetup ? HELP_DROPPED : HELP_NO_RESPONSE));
+    log("⚠ 接続できませんでした。\n" +
+        (sawInProgress ? HELP_IN_PROGRESS : droppedDuringSetup ? HELP_DROPPED : HELP_NO_RESPONSE));
     setConnUI(false);
     return false;
   } finally {
@@ -704,6 +746,7 @@ async function handshake(){
       await writeRaw(cmdHubProperty(0x0B));
       wroteOk = true;
     } catch (e){
+      noteGattError(e);
       log(`ハンドシェイク送信に失敗 (${i}/3): ${e.message}`);
       await sleep(500);
       continue;
