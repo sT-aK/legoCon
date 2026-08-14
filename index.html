@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>LEGO Hub × Xbox Controller</title>
+<style>
+  :root{
+    --bg:#14161a; --panel:#1d2026; --panel2:#262a32; --line:#333844;
+    --fg:#e9ecf1; --muted:#98a1b0; --accent:#3b9dff; --ok:#3ddc84; --warn:#ffb020; --err:#ff5a5a;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+    background:var(--bg); color:var(--fg); line-height:1.6;
+    padding:16px 14px calc(24px + env(safe-area-inset-bottom));
+    max-width:720px; margin:0 auto;
+    -webkit-text-size-adjust:100%;
+  }
+  h1{font-size:19px; margin:0 0 4px}
+  h2{font-size:14px; margin:0 0 10px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase}
+  .sub{color:var(--muted); font-size:13px; margin:0 0 16px}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px}
+  button{
+    font:inherit; font-size:15px; font-weight:600; padding:12px 16px; border:0; border-radius:10px;
+    background:var(--accent); color:#fff; cursor:pointer; -webkit-tap-highlight-color:transparent;
+    touch-action:manipulation;
+  }
+  button:disabled{opacity:.4; cursor:default}
+  button.ghost{background:var(--panel2); color:var(--fg); border:1px solid var(--line)}
+  button.stop{background:var(--err); width:100%; font-size:18px; padding:18px}
+  .row{display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px}
+  label{font-size:13px; color:var(--muted); display:block; margin-bottom:4px}
+  select,input[type=number]{
+    font:inherit; font-size:15px; width:100%; padding:9px 10px; border-radius:8px;
+    background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+  }
+  input[type=range]{width:100%; accent-color:var(--accent)}
+  .kv{display:flex; justify-content:space-between; gap:12px; font-size:14px; padding:3px 0}
+  .kv span:first-child{color:var(--muted)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums}
+  .pill{display:inline-block; font-size:12px; padding:2px 8px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); color:var(--muted)}
+  .pill.on{background:rgba(61,220,132,.15); border-color:var(--ok); color:var(--ok)}
+  .pill.off{background:rgba(255,90,90,.12); border-color:var(--err); color:var(--err)}
+  .bar{height:10px; border-radius:6px; background:var(--panel2); overflow:hidden; position:relative}
+  .bar > i{position:absolute; top:0; bottom:0; background:var(--accent); display:block}
+  .bar.center::after{content:""; position:absolute; left:50%; top:0; bottom:0; width:1px; background:var(--line)}
+  #log{
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; line-height:1.5;
+    background:#101216; border:1px solid var(--line); border-radius:8px; padding:10px;
+    height:150px; overflow:auto; white-space:pre-wrap; word-break:break-all; color:var(--muted);
+  }
+  details summary{cursor:pointer; color:var(--muted); font-size:14px}
+  .note{font-size:12.5px; color:var(--muted); margin-top:8px}
+  .warnbox{background:rgba(255,176,32,.1); border:1px solid var(--warn); color:#ffd07a; border-radius:10px; padding:12px; font-size:13.5px; margin-bottom:12px}
+  table{width:100%; border-collapse:collapse; font-size:13.5px}
+  th,td{text-align:left; padding:6px 4px; border-bottom:1px solid var(--line)}
+  th{color:var(--muted); font-weight:600; font-size:12px}
+  td select{padding:6px 8px; font-size:14px}
+</style>
+</head>
+<body>
+
+<h1>LEGO Hub × Xbox Controller</h1>
+<p class="sub">Gamepad API + Web Bluetooth (LWP3) で純正ファームウェアのままの LEGO Hub を操作します。</p>
+
+<div id="envWarn" class="warnbox" hidden></div>
+
+<!-- 接続 -->
+<div class="card">
+  <h2>1. 接続</h2>
+  <div class="row">
+    <button id="connectBtn">LEGO Hub に接続</button>
+    <button id="disconnectBtn" class="ghost" disabled>切断</button>
+  </div>
+  <div style="margin-top:12px">
+    <div class="kv"><span>Hub</span><span id="hubName" class="mono">—</span></div>
+    <div class="kv"><span>状態</span><span id="btState" class="pill off">未接続</span></div>
+    <div class="kv"><span>バッテリー</span><span id="battery" class="mono">—</span></div>
+    <div class="kv"><span>送信 / エラー</span><span id="txStat" class="mono">0 / 0</span></div>
+  </div>
+</div>
+
+<!-- コントローラー -->
+<div class="card">
+  <h2>2. コントローラー</h2>
+  <div class="kv"><span>検出</span><span id="padState" class="pill off">未検出</span></div>
+  <div class="kv"><span>ID</span><span id="padId" class="mono" style="font-size:12px; text-align:right">—</span></div>
+  <p class="note" id="padHint">コントローラーを接続したら、いずれかのボタンを1回押してください（ブラウザは初回入力があるまでゲームパッドを認識しません）。</p>
+
+  <div style="margin-top:12px">
+    <label>アクセル / ブレーキ <span id="thrVal" class="mono">0%</span></label>
+    <div class="bar center"><i id="thrBar"></i></div>
+  </div>
+  <div style="margin-top:10px">
+    <label>ステアリング入力 <span id="strVal" class="mono">0%</span></label>
+    <div class="bar center"><i id="strBar"></i></div>
+  </div>
+
+  <details style="margin-top:12px">
+    <summary>入力の割り当てと生の値を表示</summary>
+    <div class="grid" style="margin-top:10px">
+      <div>
+        <label>アクセル入力</label>
+        <select id="cfgThrottleSrc">
+          <option value="triggers">RT / LT トリガー</option>
+          <option value="axisY">スティック縦軸</option>
+        </select>
+      </div>
+      <div>
+        <label>RT の button 番号</label>
+        <input type="number" id="cfgRt" min="0" max="31" step="1">
+      </div>
+      <div>
+        <label>LT の button 番号</label>
+        <input type="number" id="cfgLt" min="0" max="31" step="1">
+      </div>
+      <div>
+        <label>アクセル軸 (縦) の axis 番号</label>
+        <input type="number" id="cfgThrAxis" min="0" max="15" step="1">
+      </div>
+      <div>
+        <label>ステアリング軸の axis 番号</label>
+        <input type="number" id="cfgStrAxis" min="0" max="15" step="1">
+      </div>
+    </div>
+    <div class="note mono" id="rawAxes" style="margin-top:10px">axes: —</div>
+    <div class="note mono" id="rawButtons">buttons: —</div>
+  </details>
+</div>
+
+<!-- ポート割り当て -->
+<div class="card">
+  <h2>3. ポート割り当て</h2>
+  <table>
+    <thead><tr><th style="width:56px">ポート</th><th>検出されたデバイス</th><th style="width:150px">役割</th></tr></thead>
+    <tbody id="portTable"></tbody>
+  </table>
+  <p class="note">ハブを接続すると、実際に接続されているモーターが自動で表示されます。42176 ポルシェの初期値は A・B = 駆動、C = ステアリングです。実機と違う場合はここで変更してください。</p>
+</div>
+
+<!-- 調整 -->
+<div class="card">
+  <h2>4. 走行設定</h2>
+  <div class="grid">
+    <div>
+      <label>最大出力 <span id="lblMaxPower" class="mono"></span></label>
+      <input type="range" id="cfgMaxPower" min="10" max="100" step="5">
+    </div>
+    <div>
+      <label>デッドゾーン <span id="lblDeadzone" class="mono"></span></label>
+      <input type="range" id="cfgDeadzone" min="0" max="40" step="1">
+    </div>
+    <div>
+      <label>スティック感度カーブ <span id="lblExpo" class="mono"></span></label>
+      <input type="range" id="cfgExpo" min="0" max="100" step="5">
+    </div>
+  </div>
+
+  <h2 style="margin-top:18px">ステアリング</h2>
+  <div class="grid">
+    <div>
+      <label>制御方式</label>
+      <select id="cfgSteerMode">
+        <option value="position">角度指定（推奨・端当て防止）</option>
+        <option value="power">出力指定（簡易）</option>
+      </select>
+    </div>
+    <div>
+      <label>最大舵角 <span id="lblSteerAngle" class="mono"></span></label>
+      <input type="range" id="cfgSteerAngle" min="10" max="120" step="5">
+    </div>
+    <div>
+      <label>ステア最大トルク <span id="lblSteerPower" class="mono"></span></label>
+      <input type="range" id="cfgSteerPower" min="10" max="100" step="5">
+    </div>
+    <div>
+      <label>トリム（中央補正） <span id="lblTrim" class="mono"></span></label>
+      <input type="range" id="cfgTrim" min="-40" max="40" step="1">
+    </div>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <label style="display:flex; align-items:center; gap:6px; margin:0; color:var(--fg); font-size:14px">
+      <input type="checkbox" id="cfgInvert"> ステアリング反転
+    </label>
+    <button class="ghost" id="calibBtn" disabled>現在位置をセンターに設定</button>
+  </div>
+  <p class="note">「角度指定」はモーターの現在角を基準にした目標角へ動かす方式です。メカストップに全力で押し付け続けないため、ステアリング機構の発熱・破損を避けられます。接続直後の位置をセンターとして扱うので、<strong>接続前にタイヤを直進状態にしておいてください</strong>。</p>
+</div>
+
+<!-- テレメトリ -->
+<div class="card">
+  <h2>5. 出力</h2>
+  <div class="kv"><span>駆動出力</span><span id="outDrive" class="mono">0 %</span></div>
+  <div class="kv"><span>ステア目標</span><span id="outSteerTarget" class="mono">—</span></div>
+  <div class="kv"><span>ステア実測</span><span id="outSteerActual" class="mono">—</span></div>
+  <div class="kv"><span>安全ロック</span><span id="armState" class="pill off">未解除</span></div>
+</div>
+
+<button class="stop" id="stopBtn">緊急停止 (STOP)</button>
+<p class="note" style="text-align:center">コントローラーの B ボタン / キーボードの Space でも停止します。</p>
+
+<div class="card" style="margin-top:12px">
+  <h2>ログ</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================
+   LEGO Wireless Protocol v3 (LWP3)
+   ============================================================ */
+const LWP3_SERVICE = "00001623-1212-efde-1623-785feabcd123";
+const LWP3_CHAR    = "00001624-1212-efde-1623-785feabcd123";
+
+const PORT_NAMES = { 0:"A", 1:"B", 2:"C", 3:"D" };
+
+// Hub Attached I/O で通知される代表的なデバイス種別
+const IO_TYPES = {
+  0x0001:"Motor", 0x0002:"Train Motor", 0x0005:"Button", 0x0008:"LED",
+  0x0014:"Voltage", 0x0015:"Current", 0x0016:"Piezo", 0x0017:"RGB Light",
+  0x0022:"Tilt Sensor", 0x0023:"Motion Sensor", 0x0024:"Color/Distance",
+  0x0025:"Motor (Tacho)", 0x0026:"Internal Motor (Tacho)", 0x0027:"Internal Tilt",
+  0x002E:"Technic Large Motor", 0x002F:"Technic XL Motor",
+  0x0030:"Technic Medium Angular Motor", 0x0031:"Technic Large Angular Motor",
+  0x004B:"Technic Medium Angular Motor", 0x004C:"Technic Large Angular Motor",
+};
+// 一覧にない ID は 16 進数のまま表示する（機種固有の内蔵モーターなど）
+
+/* ============================================================
+   設定（localStorage に保存）
+   ============================================================ */
+const DEFAULTS = {
+  throttleSrc:"triggers", rtIndex:7, ltIndex:6, thrAxis:1, strAxis:0,
+  maxPower:70, deadzone:10, expo:35,
+  steerMode:"position", steerAngle:60, steerPower:50, trim:0, invert:false,
+  roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
+};
+const cfg = load();
+
+function clone(o){ return JSON.parse(JSON.stringify(o)); }
+function load(){
+  try {
+    const raw = localStorage.getItem("legocon.cfg");
+    if (!raw) return clone(DEFAULTS);
+    const saved = JSON.parse(raw);
+    return Object.assign(clone(DEFAULTS), saved,
+      { roles: Object.assign({}, DEFAULTS.roles, saved.roles || {}) });
+  } catch { return clone(DEFAULTS); }
+}
+function save(){
+  try { localStorage.setItem("legocon.cfg", JSON.stringify(cfg)); } catch {}
+}
+
+/* ============================================================
+   状態
+   ============================================================ */
+let device = null, characteristic = null, canWriteWithoutResponse = false;
+let connected = false;
+let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
+let txCount = 0, errCount = 0;
+let steerPort = null;              // 現在ステアリングに割り当てられているポート番号
+let steerCenter = null;            // センターとみなす角度（POS カウンタ値）
+let steerActual = null;            // 実測角度
+let steerSubTime = 0;              // 角度通知を要求した時刻（フォールバック判定用）
+const detected = {};               // portId -> デバイス名
+const lastSent = {};               // key -> { value, time }
+
+const $ = id => document.getElementById(id);
+
+function log(msg){
+  const el = $("log");
+  const t = new Date().toLocaleTimeString("ja-JP", { hour12:false });
+  el.textContent += `[${t}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+/* ============================================================
+   送信キュー
+   BLE の GATT 操作は直列でしか実行できないため、書き込みを1本の
+   キューに通す。同じキー（ポート）の未送信コマンドは新しい値で
+   上書きされるので、古い指示が溜まって遅延することがない。
+   ============================================================ */
+const pending = new Map();         // key -> { bytes, force }
+let draining = false, drainTimer = null;
+const MIN_INTERVAL_MS = 35;        // 同一ポートへの最短送信間隔（BLE の帯域を守る）
+
+function queueCommand(key, bytes, force){
+  if (!characteristic) return;
+  pending.set(key, { bytes, force: !!force });   // 同じポートの古い指示は自動的に上書きされる
+  drain();
+}
+
+async function drain(){
+  if (draining) return;
+  draining = true;
+  try {
+    while (pending.size && characteristic){
+      // レート制限に引っかからない最初のエントリを選ぶ
+      const now = performance.now();
+      let key = null, wait = MIN_INTERVAL_MS;
+      for (const [k, item] of pending){
+        const dt = now - (lastSent[k] || 0);
+        if (item.force || dt >= MIN_INTERVAL_MS){ key = k; break; }
+        wait = Math.min(wait, MIN_INTERVAL_MS - dt);
+      }
+      if (key === null){                          // 全部が待機中 → 少し後に再開
+        if (!drainTimer){
+          drainTimer = setTimeout(() => { drainTimer = null; drain(); }, Math.max(5, Math.ceil(wait)));
+        }
+        break;
+      }
+
+      const { bytes } = pending.get(key);
+      pending.delete(key);
+      lastSent[key] = performance.now();
+      try {
+        if (canWriteWithoutResponse) await characteristic.writeValueWithoutResponse(bytes);
+        else await characteristic.writeValue(bytes);
+        txCount++;
+      } catch (e){
+        errCount++;
+        if (errCount % 20 === 1) log("送信エラー: " + (e && e.message ? e.message : e));
+      }
+    }
+  } finally {
+    draining = false;
+    $("txStat").textContent = `${txCount} / ${errCount}`;
+  }
+}
+
+/* ============================================================
+   LWP3 コマンド生成
+   ============================================================ */
+
+// Port Output Command / WriteDirectModeData (mode 0 = POWER)
+function cmdPower(port, power){
+  let p = Math.max(-100, Math.min(100, Math.round(power)));
+  if (p < 0) p = 256 + p;                       // 符号付き8bit
+  return new Uint8Array([0x08, 0x00, 0x81, port, 0x11, 0x51, 0x00, p]);
+}
+
+// Port Output Command / GotoAbsolutePosition
+function cmdGoto(port, degrees, speed, maxPower){
+  const pos = Math.round(degrees) | 0;
+  const b = new Uint8Array(14);
+  b.set([0x0E, 0x00, 0x81, port, 0x11, 0x0D]);
+  new DataView(b.buffer).setInt32(6, pos, true); // int32 LE
+  b[10] = Math.max(1, Math.min(100, Math.round(speed)));
+  b[11] = Math.max(1, Math.min(100, Math.round(maxPower)));
+  b[12] = 126;                                  // EndState: HOLD
+  b[13] = 0;                                    // UseProfile: なし
+  return b;
+}
+
+// Port Input Format Setup (Single) — センサー値の通知を有効化
+function cmdSubscribe(port, mode, delta){
+  const b = new Uint8Array(10);
+  b.set([0x0A, 0x00, 0x41, port, mode]);
+  new DataView(b.buffer).setUint32(5, delta, true);
+  b[9] = 1;                                     // 通知 ON
+  return b;
+}
+
+// Hub Properties — バッテリー残量の更新通知を有効化
+const CMD_BATTERY_SUB = new Uint8Array([0x05, 0x00, 0x01, 0x06, 0x02]);
+
+/* ============================================================
+   受信メッセージの解析
+   ============================================================ */
+function onNotify(event){
+  const v = event.target.value;
+  const d = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  if (d.length < 3) return;
+  const type = d[2];
+
+  if (type === 0x04){                                   // Hub Attached I/O
+    const port = d[3], ev = d[4];
+    if (ev === 0){
+      delete detected[port];
+      log(`ポート ${PORT_NAMES[port] ?? port}: 取り外し`);
+    } else {
+      const ioType = d[5] | (d[6] << 8);
+      const name = IO_TYPES[ioType] || `不明 (0x${ioType.toString(16).padStart(4,"0")})`;
+      detected[port] = name;
+      log(`ポート ${PORT_NAMES[port] ?? port}: ${name}`);
+      if (port === steerPort) subscribeSteer();
+    }
+    renderPorts();
+
+  } else if (type === 0x45){                            // Port Value (Single)
+    const port = d[3];
+    if (port === steerPort && d.length >= 8){
+      const pos = new DataView(d.buffer, d.byteOffset).getInt32(4, true);
+      steerActual = pos;
+      if (steerCenter === null){
+        steerCenter = pos;
+        log(`ステアリング中央を ${pos}° として記録しました`);
+      }
+    }
+
+  } else if (type === 0x01){                            // Hub Property
+    if (d[3] === 0x06 && d.length >= 6) $("battery").textContent = d[5] + " %";
+
+  } else if (type === 0x05){                            // Generic Error
+    log(`ハブがエラーを返しました (command 0x${d[3].toString(16)}, code 0x${d[4].toString(16)})`);
+  }
+}
+
+function subscribeSteer(){
+  if (steerPort === null || cfg.steerMode !== "position") return;
+  steerCenter = null;
+  steerSubTime = performance.now();
+  queueCommand("sub" + steerPort, cmdSubscribe(steerPort, 2, 2), true); // mode 2 = POS
+}
+
+/* ============================================================
+   接続 / 切断
+   ============================================================ */
+$("connectBtn").addEventListener("click", async () => {
+  if (!navigator.bluetooth){
+    alert("このブラウザは Web Bluetooth に対応していません。iOS では Bluefy、PC では Chrome / Edge をお使いください。");
+    return;
+  }
+  try {
+    $("connectBtn").disabled = true;
+    log("デバイスを検索中…");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [LWP3_SERVICE] }],
+      optionalServices: [LWP3_SERVICE],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    log(`接続中: ${device.name || "(名前なし)"}`);
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(LWP3_SERVICE);
+    characteristic = await service.getCharacteristic(LWP3_CHAR);
+
+    const props = characteristic.properties;
+    canWriteWithoutResponse =
+      !!(props && props.writeWithoutResponse) &&
+      typeof characteristic.writeValueWithoutResponse === "function";
+
+    try {
+      await characteristic.startNotifications();
+      characteristic.addEventListener("characteristicvaluechanged", onNotify);
+    } catch (e){
+      log("通知の購読に失敗（角度フィードバックなしで続行）: " + e.message);
+    }
+
+    connected = true; armed = false;
+    steerCenter = null; steerActual = null;
+    txCount = 0; errCount = 0;
+    setConnUI(true);
+    $("hubName").textContent = device.name || "(名前なし)";
+    log(`接続完了 (write ${canWriteWithoutResponse ? "without response" : "with response"})`);
+
+    queueCommand("battery", CMD_BATTERY_SUB, true);
+    applyRoles();
+    requestWakeLock();
+
+  } catch (e){
+    if (e && (e.name === "NotFoundError" || e.name === "AbortError")){
+      log("デバイス選択がキャンセルされました");
+    } else {
+      log("接続失敗: " + (e && e.message ? e.message : e));
+      alert("接続に失敗しました: " + (e && e.message ? e.message : e));
+    }
+    setConnUI(false);
+  }
+});
+
+$("disconnectBtn").addEventListener("click", async () => {
+  stopAll();
+  setTimeout(() => { if (device && device.gatt.connected) device.gatt.disconnect(); }, 150);
+});
+
+function onDisconnected(){
+  connected = false; characteristic = null; pending.clear();
+  setConnUI(false);
+  log("ハブとの接続が切れました");
+}
+
+function setConnUI(on){
+  connected = on;
+  $("connectBtn").disabled = on;
+  $("disconnectBtn").disabled = !on;
+  $("calibBtn").disabled = !on;
+  const s = $("btState");
+  s.textContent = on ? "接続中" : "未接続";
+  s.className = "pill " + (on ? "on" : "off");
+  if (!on){
+    $("hubName").textContent = "—";
+    $("battery").textContent = "—";
+    for (const k of Object.keys(detected)) delete detected[k];
+    renderPorts();
+    setArmed(false);
+  }
+}
+
+/* ============================================================
+   ポート割り当て UI
+   ============================================================ */
+function renderPorts(){
+  const tbody = $("portTable");
+  tbody.innerHTML = "";
+  for (const p of [0,1,2,3]){
+    const tr = document.createElement("tr");
+
+    const tdPort = document.createElement("td");
+    tdPort.innerHTML = `<strong>${PORT_NAMES[p]}</strong>`;
+    tr.appendChild(tdPort);
+
+    const tdDev = document.createElement("td");
+    tdDev.className = "mono";
+    tdDev.style.fontSize = "12px";
+    tdDev.style.color = detected[p] ? "var(--ok)" : "var(--muted)";
+    tdDev.textContent = detected[p] || (connected ? "未接続" : "—");
+    tr.appendChild(tdDev);
+
+    const tdRole = document.createElement("td");
+    const sel = document.createElement("select");
+    for (const [val, label] of [["none","使わない"],["drive","駆動"],["drive_rev","駆動（反転）"],["steer","ステアリング"]]){
+      const o = document.createElement("option");
+      o.value = val; o.textContent = label;
+      if (cfg.roles[p] === val) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener("change", () => {
+      if (sel.value === "steer"){
+        for (const q of [0,1,2,3]) if (q !== p && cfg.roles[q] === "steer") cfg.roles[q] = "none";
+      }
+      cfg.roles[p] = sel.value;
+      save(); applyRoles(); renderPorts();
+    });
+    tdRole.appendChild(sel);
+    tr.appendChild(tdRole);
+
+    tbody.appendChild(tr);
+  }
+}
+
+function applyRoles(){
+  const prev = steerPort;
+  steerPort = null;
+  for (const p of [0,1,2,3]) if (cfg.roles[p] === "steer") steerPort = p;
+  if (steerPort !== prev){
+    steerActual = null; steerCenter = null;
+    if (prev !== null && connected) queueCommand("p" + prev, cmdPower(prev, 0), true);
+  }
+  if (connected) subscribeSteer();
+}
+
+/* ============================================================
+   入力（ゲームパッド / キーボード）
+   ============================================================ */
+const keys = new Set();
+addEventListener("keydown", e => {
+  if (e.code === "Space"){ stopAll(); e.preventDefault(); return; }
+  keys.add(e.code);
+});
+addEventListener("keyup", e => keys.delete(e.code));
+
+addEventListener("gamepadconnected", e => log(`コントローラー検出: ${e.gamepad.id}`));
+addEventListener("gamepaddisconnected", e => { log("コントローラー切断"); stopAll(); });
+
+function getPad(){
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (const p of pads) if (p && p.connected) return p;
+  return null;
+}
+function btnValue(pad, i){
+  const b = pad.buttons[i];
+  if (!b) return 0;
+  return typeof b === "number" ? b : (typeof b.value === "number" ? b.value : (b.pressed ? 1 : 0));
+}
+function axisValue(pad, i){
+  const a = pad.axes[i];
+  return typeof a === "number" ? a : 0;
+}
+function shape(x){
+  const dz = cfg.deadzone / 100;
+  const a = Math.abs(x);
+  if (a <= dz) return 0;
+  let n = (a - dz) / (1 - dz);
+  const k = cfg.expo / 100;
+  n = k * n * n * n + (1 - k) * n;
+  return Math.sign(x) * Math.min(1, n);
+}
+
+/* ============================================================
+   制御ループ
+   ============================================================ */
+let lastDrive = null, lastSteer = null, bPrev = false;
+
+function loop(){
+  const pad = getPad();
+  let throttle = 0, steer = 0;
+
+  if (pad){
+    $("padState").textContent = "検出";
+    $("padState").className = "pill on";
+    $("padId").textContent = pad.id;
+    $("padHint").hidden = true;
+
+    if (cfg.throttleSrc === "triggers"){
+      throttle = btnValue(pad, cfg.rtIndex) - btnValue(pad, cfg.ltIndex);
+    } else {
+      throttle = -axisValue(pad, cfg.thrAxis);   // 上倒し = 前進
+    }
+    steer = axisValue(pad, cfg.strAxis);
+
+    const bNow = btnValue(pad, 1) > 0.5;         // B ボタン（押した瞬間だけ反応）
+    if (bNow && !bPrev) stopAll();
+    bPrev = bNow;
+    updateRawDebug(pad);
+  } else {
+    $("padState").textContent = "未検出";
+    $("padState").className = "pill off";
+    $("padHint").hidden = false;
+    // キーボード（動作確認用）
+    if (keys.has("ArrowUp") || keys.has("KeyW")) throttle = 1;
+    if (keys.has("ArrowDown") || keys.has("KeyS")) throttle = -1;
+    if (keys.has("ArrowLeft") || keys.has("KeyA")) steer = -1;
+    if (keys.has("ArrowRight") || keys.has("KeyD")) steer = 1;
+  }
+
+  throttle = shape(Math.max(-1, Math.min(1, throttle)));
+  steer = shape(Math.max(-1, Math.min(1, steer)));
+  if (cfg.invert) steer = -steer;
+
+  // 安全ロック: 接続直後にアクセルが握られたままでも走り出さない
+  if (connected && !armed && Math.abs(throttle) < 0.02) setArmed(true);
+  const out = (connected && armed) ? throttle : 0;
+
+  updateInputUI(throttle, steer);
+  if (connected) sendControl(out, steer);
+
+  requestAnimationFrame(loop);
+}
+
+function sendControl(throttle, steer){
+  // ---- 駆動 ----
+  const power = Math.round(throttle * cfg.maxPower);
+  if (lastDrive === null || Math.abs(power - lastDrive) >= 2 || (power === 0 && lastDrive !== 0)){
+    for (const p of [0,1,2,3]){
+      const role = cfg.roles[p];
+      if (role !== "drive" && role !== "drive_rev") continue;
+      queueCommand("p" + p, cmdPower(p, role === "drive_rev" ? -power : power), power === 0);
+    }
+    lastDrive = power;
+    $("outDrive").textContent = power + " %";
+  }
+
+  // ---- ステアリング ----
+  if (steerPort === null) return;
+  if (cfg.steerMode === "position"){
+    // 角度通知が来ない環境（通知未対応など）では 1.5 秒後に 0 をセンターとみなす
+    if (steerCenter === null && performance.now() - steerSubTime > 1500){
+      steerCenter = 0;
+      log("角度フィードバックが得られないため、センターを 0° と仮定します");
+    }
+    if (steerCenter === null){
+      $("outSteerTarget").textContent = "較正待ち";
+      return;
+    }
+    const target = Math.round(steer * cfg.steerAngle + cfg.trim);
+    if (lastSteer === null || Math.abs(target - lastSteer) >= 2 || (target === 0 && lastSteer !== 0)){
+      queueCommand("s" + steerPort, cmdGoto(steerPort, steerCenter + target, 100, cfg.steerPower), false);
+      lastSteer = target;
+      $("outSteerTarget").textContent = target + " °";
+    }
+    $("outSteerActual").textContent =
+      (steerActual === null) ? "—" : ((steerActual - (steerCenter ?? 0)) + " °");
+  } else {
+    const sp = Math.round(steer * cfg.steerPower);
+    if (lastSteer === null || Math.abs(sp - lastSteer) >= 3 || (sp === 0 && lastSteer !== 0)){
+      queueCommand("s" + steerPort, cmdPower(steerPort, sp), sp === 0);
+      lastSteer = sp;
+      $("outSteerTarget").textContent = sp + " %";
+    }
+    $("outSteerActual").textContent = "—";
+  }
+}
+
+function setArmed(on){
+  armed = on;
+  const el = $("armState");
+  el.textContent = on ? "解除済み" : "未解除";
+  el.className = "pill " + (on ? "on" : "off");
+}
+
+function stopAll(){
+  lastDrive = null; lastSteer = null;
+  setArmed(false);
+  if (!characteristic) return;
+  pending.clear();
+  for (const p of [0,1,2,3]){
+    if (cfg.roles[p] === "none") continue;
+    queueCommand("p" + p, cmdPower(p, 0), true);
+  }
+  if (steerPort !== null) queueCommand("s" + steerPort, cmdPower(steerPort, 0), true);
+  log("停止");
+}
+$("stopBtn").addEventListener("click", stopAll);
+
+// バックグラウンドに回った / タブを閉じた場合は必ず停止
+addEventListener("visibilitychange", () => { if (document.hidden) stopAll(); });
+addEventListener("pagehide", stopAll);
+
+/* ============================================================
+   UI 更新
+   ============================================================ */
+function bar(el, v){                     // v: -1 〜 1（中央基点）
+  const pct = Math.abs(v) * 50;
+  el.style.left = (v >= 0 ? 50 : 50 - pct) + "%";
+  el.style.width = pct + "%";
+  el.style.background = v >= 0 ? "var(--accent)" : "var(--warn)";
+}
+function updateInputUI(thr, str){
+  bar($("thrBar"), thr); bar($("strBar"), str);
+  $("thrVal").textContent = Math.round(thr * 100) + "%";
+  $("strVal").textContent = Math.round(str * 100) + "%";
+}
+let rawTick = 0;
+function updateRawDebug(pad){
+  if (++rawTick % 6) return;             // 10Hz 程度に間引き
+  $("rawAxes").textContent = "axes: " +
+    Array.from(pad.axes).map((a, i) => `${i}:${Number(a).toFixed(2)}`).join("  ");
+  const pressed = Array.from(pad.buttons)
+    .map((b, i) => ({ i, v: btnValue(pad, i) }))
+    .filter(o => o.v > 0.02)
+    .map(o => `${o.i}:${o.v.toFixed(2)}`)
+    .join("  ");
+  $("rawButtons").textContent = "buttons: " + (pressed || "—");
+}
+
+/* ============================================================
+   設定 UI のバインド
+   ============================================================ */
+function bindNumber(id, key){
+  const el = $(id);
+  el.value = cfg[key];
+  el.addEventListener("change", () => {
+    const v = parseInt(el.value, 10);
+    if (!Number.isNaN(v)){ cfg[key] = v; save(); }
+    el.value = cfg[key];
+  });
+}
+function bindRange(id, key, labelId, fmt){
+  const el = $(id), lb = $(labelId);
+  el.value = cfg[key];
+  const upd = () => { lb.textContent = fmt(cfg[key]); };
+  el.addEventListener("input", () => { cfg[key] = parseInt(el.value, 10); upd(); save(); });
+  upd();
+}
+
+bindNumber("cfgRt", "rtIndex");
+bindNumber("cfgLt", "ltIndex");
+bindNumber("cfgThrAxis", "thrAxis");
+bindNumber("cfgStrAxis", "strAxis");
+
+bindRange("cfgMaxPower", "maxPower", "lblMaxPower", v => v + " %");
+bindRange("cfgDeadzone", "deadzone", "lblDeadzone", v => v + " %");
+bindRange("cfgExpo", "expo", "lblExpo", v => v + " %");
+bindRange("cfgSteerAngle", "steerAngle", "lblSteerAngle", v => "±" + v + " °");
+bindRange("cfgSteerPower", "steerPower", "lblSteerPower", v => v + " %");
+bindRange("cfgTrim", "trim", "lblTrim", v => v + " °");
+
+$("cfgThrottleSrc").value = cfg.throttleSrc;
+$("cfgThrottleSrc").addEventListener("change", e => { cfg.throttleSrc = e.target.value; save(); });
+
+$("cfgSteerMode").value = cfg.steerMode;
+$("cfgSteerMode").addEventListener("change", e => {
+  cfg.steerMode = e.target.value; save(); lastSteer = null;
+  if (connected) subscribeSteer();
+});
+
+$("cfgInvert").checked = cfg.invert;
+$("cfgInvert").addEventListener("change", e => { cfg.invert = e.target.checked; save(); });
+
+$("calibBtn").addEventListener("click", () => {
+  if (steerActual === null){
+    log("角度が取得できていません（「出力指定」モードでは較正できません）");
+    return;
+  }
+  steerCenter = steerActual;
+  lastSteer = null;
+  log(`ステアリング中央を ${steerCenter}° に再設定しました`);
+});
+
+/* ============================================================
+   起動時チェック
+   ============================================================ */
+function envCheck(){
+  const msgs = [];
+  if (!navigator.bluetooth){
+    msgs.push("<strong>Web Bluetooth が使えません。</strong> iPhone / iPad では <strong>Bluefy</strong> ブラウザ、PC では Chrome または Edge で開いてください（Safari・Chrome for iOS は非対応です）。");
+  }
+  if (!window.isSecureContext){
+    msgs.push("<strong>HTTPS ではありません。</strong> Web Bluetooth は HTTPS か localhost でのみ動作します。GitHub Pages などに置いて開いてください。");
+  }
+  if (!navigator.getGamepads){
+    msgs.push("<strong>Gamepad API が使えません。</strong> ブラウザを更新してください。");
+  }
+  if (msgs.length){
+    $("envWarn").hidden = false;
+    $("envWarn").innerHTML = msgs.join("<br><br>");
+  }
+}
+
+async function requestWakeLock(){
+  try {
+    if ("wakeLock" in navigator) await navigator.wakeLock.request("screen");
+  } catch {}
+}
+
+envCheck();
+renderPorts();
+applyRoles();
+log("準備完了。コントローラーのボタンを押してから「LEGO Hub に接続」をタップしてください。");
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
