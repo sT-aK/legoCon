@@ -319,6 +319,7 @@ let autoReconnects = 0;            // 自動再接続の実行回数
 let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
 let notifyWorking = false;         // ハブからの通知が受け取れているか
 let lastGotoTime = 0;              // 直近に角度指令を送った時刻
+let steerNeedsSub = true;          // 舵角の購読がまだなら true
 let holdTest = false;              // 接続保持テストの実行中
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
@@ -520,7 +521,7 @@ function onNotify(event){
       const isNew = detected[port] !== name;
       detected[port] = name; detectedType[port] = ioType;
       if (isNew) log(`ポート ${portLabel(port)}: ${name}`);
-      if (port === steerPort) subscribeSteer();
+      if (port === steerPort) steerNeedsSub = true;   // 購読は操作開始時まで待つ
     }
     renderPorts();
     renderTestPorts();
@@ -723,6 +724,8 @@ async function connectOnce(attempt){
   armed = false;
   steerCenter = null; steerActual = null;
   txCount = 0; errCount = 0; rxCount = 0; consecutiveErrors = 0;
+  // 0 を「送信済み」として始めることで、操作されるまで一切送らない
+  lastDrive = 0; lastSteer = 0;
 
   // 通知の購読はここで 1 回だけ試す。粘ると最初の書き込みまでが遅れ、
   // その間にハブが接続を切ってしまう。
@@ -758,6 +761,8 @@ async function connectOnce(attempt){
 
   applyRoles();
   requestWakeLock();
+
+  log("操作するまでコマンドは送りません。ここで切断される場合、原因は送信内容ではありません。");
   return true;
 }
 
@@ -799,6 +804,7 @@ async function openHub(){
                 `  このハブが持つポート: ${found.map(portLabel).join(", ")}\n` +
                 "  診断の「ポートスキャン」でどのポートが動くか確かめ、「ポート割り当て」で設定してください。");
           }
+          logAssignment();
         }, 2000);
         return true;
       } catch (e){
@@ -1022,7 +1028,9 @@ function applyRoles(){
     steerActual = null; steerCenter = null;
     if (prev !== null && connected) queueCommand("p" + prev, cmdPower(prev, 0), true);
   }
-  if (connected) subscribeSteer();
+  // 購読は実際にステアリングを操作したときに行う。
+  // 接続直後に送るコマンドを増やすと、切断の原因を切り分けられなくなる。
+  steerNeedsSub = true;
 }
 
 /* ============================================================
@@ -1197,6 +1205,14 @@ function loop(){
 }
 
 // 検出が効いているのに存在しないポートへ送っても、ハブがエラーを返すだけ。
+function logAssignment(){
+  const drive = Object.keys(cfg.roles).filter(k => cfg.roles[k].startsWith("drive")).map(Number);
+  const steer = Object.keys(cfg.roles).filter(k => cfg.roles[k] === "steer").map(Number);
+  log(`現在の割り当て — 駆動: ${drive.length ? drive.map(portLabel).join(", ") : "なし"}`
+      + ` / ステアリング: ${steer.length ? steer.map(portLabel).join(", ") : "なし"}`
+      + ` / 制御方式: ${cfg.steerMode === "position" ? "角度指定" : "出力指定"}`);
+}
+
 function portUsable(p){
   return !notifyWorking || Object.keys(detected).length === 0 || !!detected[p];
 }
@@ -1219,13 +1235,19 @@ function sendControl(throttle, steer){
   // ---- ステアリング ----
   if (steerPort === null || !portUsable(steerPort)) return;
   if (cfg.steerMode === "position"){
+    // 舵角の購読も、実際にステアリングが操作されるまで送らない
+    if (steerNeedsSub){
+      if (Math.abs(steer) < 0.02){ $("outSteerTarget").textContent = "待機中"; return; }
+      steerNeedsSub = false;
+      subscribeSteer();
+    }
     // 角度が読めないまま角度指令を出すと、機種によってはハブが接続ごと切ってしまう。
     // センターが分からない = 目標角の基準がない、ということでもあるので出力指定に落とす。
     if (steerCenter === null){
       if (performance.now() - steerSubTime > 1500){
         cfg.steerMode = "power"; save();
         $("cfgSteerMode").value = "power";
-        lastSteer = null;
+        lastSteer = 0;               // 停止中なので改めて 0 を送る必要はない
         log("角度フィードバックが得られないため、ステアリングを「出力指定」に切り替えました。\n" +
             "  端当てを避けるため「ステア最大トルク」は低め（30〜50%）にしてください。");
       } else {
@@ -1326,7 +1348,7 @@ bindRange("cfgTrim", "trim", "lblTrim", v => v + " °");
 $("cfgSteerMode").value = cfg.steerMode;
 $("cfgSteerMode").addEventListener("change", e => {
   cfg.steerMode = e.target.value; save(); lastSteer = null;
-  if (connected) subscribeSteer();
+  steerNeedsSub = true;
 });
 
 $("cfgDriveCmd").value = cfg.driveCmd;
