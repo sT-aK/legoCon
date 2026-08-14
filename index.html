@@ -163,8 +163,8 @@
     <div>
       <label>制御方式</label>
       <select id="cfgSteerMode">
-        <option value="position">角度指定（推奨・端当て防止）</option>
-        <option value="power">出力指定（簡易）</option>
+        <option value="power">出力指定（どの機種でも動く）</option>
+        <option value="position">角度指定（要・舵角フィードバック）</option>
       </select>
     </div>
     <div>
@@ -186,7 +186,7 @@
     </label>
     <button class="ghost" id="calibBtn" disabled>現在位置をセンターに設定</button>
   </div>
-  <p class="note">「角度指定」はモーターの現在角を基準にした目標角へ動かす方式です。メカストップに全力で押し付け続けないため、ステアリング機構の発熱・破損を避けられます。接続直後の位置をセンターとして扱うので、<strong>接続前にタイヤを直進状態にしておいてください</strong>。</p>
+  <p class="note">「角度指定」はモーターの現在角を基準に目標角へ動かす方式で、メカストップに全力で押し付け続けないぶん機構に優しくなります。ただし舵角フィードバックが読める機種でしか使えず、非対応の機種では<strong>ハブが接続を切ってしまう</strong>ため、既定は「出力指定」です。角度が読めない・角度指令が拒否された場合は自動的に「出力指定」へ戻ります。<br>「出力指定」では端当ての負荷を抑えるため、<strong>「ステア最大トルク」を低め（30〜50%）</strong>にしてください。</p>
 </div>
 
 <!-- テレメトリ -->
@@ -284,7 +284,7 @@ const DEFAULTS = {
     steer: { kind:"axis",   index:0, rest:0, dir:1, span:1 },
   },
   driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
-  steerMode:"position", steerAngle:60, steerPower:50, trim:0, invert:false,
+  steerMode:"power", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
 };
 const cfg = load();
@@ -517,8 +517,9 @@ function onNotify(event){
     } else {
       const ioType = d[5] | (d[6] << 8);
       const name = IO_TYPES[ioType] || `不明 (0x${ioType.toString(16).padStart(4,"0")})`;
+      const isNew = detected[port] !== name;
       detected[port] = name; detectedType[port] = ioType;
-      log(`ポート ${portLabel(port)}: ${name}`);
+      if (isNew) log(`ポート ${portLabel(port)}: ${name}`);
       if (port === steerPort) subscribeSteer();
     }
     renderPorts();
@@ -924,6 +925,14 @@ function onDisconnected(){
   setConnUI(false);
   log("ハブとの接続が切れました");
 
+  if (cfg.steerMode === "position" && performance.now() - lastGotoTime < 2500){
+    cfg.steerMode = "power"; save();
+    $("cfgSteerMode").value = "power";
+    lastSteer = null;
+    log("→ 角度指令の直後に切断されました。このハブは角度指定に対応していないと判断し、\n" +
+        "  ステアリングを「出力指定」に切り替えました。");
+  }
+
   // 意図しない切断なら一度だけ自動で張り直す。
   // ハブが接続直後に落とす個体・環境があるため。
   if (!intentionalDisconnect && device && autoReconnects < 2 && !connecting){
@@ -947,7 +956,6 @@ function setConnUI(on){
   if (!on){
     $("hubName").textContent = "—";
     $("battery").textContent = "—";
-    for (const k of Object.keys(detected)){ delete detected[k]; delete detectedType[k]; }
     renderPorts();
     setArmed(false);
   }
@@ -1211,13 +1219,18 @@ function sendControl(throttle, steer){
   // ---- ステアリング ----
   if (steerPort === null || !portUsable(steerPort)) return;
   if (cfg.steerMode === "position"){
-    // 角度通知が来ない環境（通知未対応など）では 1.5 秒後に 0 をセンターとみなす
-    if (steerCenter === null && performance.now() - steerSubTime > 1500){
-      steerCenter = 0;
-      log("角度フィードバックが得られないため、センターを 0° と仮定します");
-    }
+    // 角度が読めないまま角度指令を出すと、機種によってはハブが接続ごと切ってしまう。
+    // センターが分からない = 目標角の基準がない、ということでもあるので出力指定に落とす。
     if (steerCenter === null){
-      $("outSteerTarget").textContent = "較正待ち";
+      if (performance.now() - steerSubTime > 1500){
+        cfg.steerMode = "power"; save();
+        $("cfgSteerMode").value = "power";
+        lastSteer = null;
+        log("角度フィードバックが得られないため、ステアリングを「出力指定」に切り替えました。\n" +
+            "  端当てを避けるため「ステア最大トルク」は低め（30〜50%）にしてください。");
+      } else {
+        $("outSteerTarget").textContent = "較正待ち";
+      }
       return;
     }
     const target = Math.round(steer * cfg.steerAngle + cfg.trim);
