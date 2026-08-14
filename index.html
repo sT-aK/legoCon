@@ -153,6 +153,11 @@
       </select>
     </div>
     <div>
+      <label style="display:flex; align-items:center; gap:6px; color:var(--fg); margin-top:22px">
+        <input type="checkbox" id="cfgReverse"> 駆動の前後を反転
+      </label>
+    </div>
+    <div>
       <label>最大出力 <span id="lblMaxPower" class="mono"></span></label>
       <input type="range" id="cfgMaxPower" min="10" max="100" step="5">
     </div>
@@ -291,7 +296,7 @@ const DEFAULTS = {
     brake: { kind:"button", index:6, rest:0, dir:1, span:1 },
     steer: { kind:"axis",   index:0, rest:0, dir:1, span:1 },
   },
-  autoReconnect:true, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
+  autoReconnect:true, reverse:false, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
   steerMode:"power", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
 };
@@ -521,8 +526,9 @@ function cmdHubProperty(prop){
 const HUB_PROPS = { 0x01:"名前", 0x03:"ファームウェア", 0x04:"ハードウェア", 0x06:"バッテリー", 0x0B:"機種 ID" };
 // 実機で確認したポート構成。ポートスキャンで指令の受理を確認し、
 // 実際に車輪とステアリングが動くことを目視で確認済み。
+// 42176 は左右のモーターが対向して組まれているため、片方を反転する必要がある。
 const KNOWN_LAYOUTS = {
-  0x84: { name:"Technic Move Hub", drive:[50, 51], steer:52 },
+  0x84: { name:"Technic Move Hub", drive:[51], driveRev:[50], steer:52 },
 };
 
 const SYSTEM_TYPES = {
@@ -1279,30 +1285,37 @@ function applyKnownLayout(found, force){
   if (!layout) return false;
   if (!force && Object.keys(cfg.roles).some(k => cfg.roles[k] !== "none")) return false;
 
-  const ports = [...layout.drive, layout.steer];
+  const ports = layoutPorts(layout);
   if (found && !ports.every(p => found.includes(p))) return false;
 
   for (const k of Object.keys(cfg.roles)) cfg.roles[k] = "none";
   // 構成に含まれるポートだけ判定をやり直す。外れたポートは弾かれると分かっている。
-  for (const p of [...layout.drive, layout.steer]) badPorts.delete(p);
+  for (const p of ports) badPorts.delete(p);
   recentOutputs.length = 0;
   for (const p of layout.drive) cfg.roles[p] = "drive";
+  for (const p of (layout.driveRev || [])) cfg.roles[p] = "drive_rev";
   cfg.roles[layout.steer] = "steer";
   save(); applyRoles(); renderPorts();
   log(`${layout.name} の確認済みの構成を適用しました — ` +
-      `駆動: ${layout.drive.map(portLabel).join(", ")} / ステアリング: ${portLabel(layout.steer)}\n` +
-      "  車体がその場で回る・前に進まない場合は、駆動の片方を「駆動（反転）」に変えてください。");
+      `駆動: ${layout.drive.map(portLabel).join(", ")}` +
+      `${(layout.driveRev || []).length ? " / 駆動（反転）: " + layout.driveRev.map(portLabel).join(", ") : ""}` +
+      ` / ステアリング: ${portLabel(layout.steer)}\n` +
+      "  トリガーを引いて後進する場合は、走行設定の「駆動の前後を反転」を入れてください。");
   return true;
 }
 
 // モーターでないポートにモーター指令を送ると、ハブが接続を切ることがある。
 // 確認済みの構成から外れた割り当てを見つけたら知らせる。
+function layoutPorts(layout){
+  return [...layout.drive, ...(layout.driveRev || []), layout.steer];
+}
+
 function checkLayout(){
   const layout = KNOWN_LAYOUTS[hubSystemType];
   $("applyLayoutBtn").disabled = !layout;
   if (!layout) return;
 
-  const known = new Set([...layout.drive, layout.steer]);
+  const known = new Set(layoutPorts(layout));
   const outside = Object.keys(cfg.roles)
     .filter(k => cfg.roles[k] !== "none")
     .map(Number)
@@ -1310,7 +1323,8 @@ function checkLayout(){
   if (!outside.length) return;
 
   log(`⚠ ${layout.name} で確認されていないポートが割り当てられています: ${outside.map(portLabel).join(", ")}\n` +
-      `  確認済みの構成: 駆動 ${layout.drive.map(portLabel).join(", ")} / ステアリング ${portLabel(layout.steer)}\n` +
+      `  確認済みの構成: 駆動 ${[...layout.drive, ...(layout.driveRev || [])].map(portLabel).join(", ")}` +
+      ` / ステアリング ${portLabel(layout.steer)}\n` +
       "  モーターでないポートにモーター指令を送ると、ハブが接続を切ることがあります。\n" +
       "  「ポート割り当て」の下の「確認済みの構成を適用」を押すと直せます。");
 }
@@ -1322,11 +1336,13 @@ $("applyLayoutBtn").addEventListener("click", () => {
 });
 
 function logAssignment(){
-  const drive = Object.keys(cfg.roles).filter(k => cfg.roles[k].startsWith("drive")).map(Number);
-  const steer = Object.keys(cfg.roles).filter(k => cfg.roles[k] === "steer").map(Number);
+  const byRole = r => Object.keys(cfg.roles).filter(k => cfg.roles[k] === r).map(Number);
+  const drive = byRole("drive"), rev = byRole("drive_rev"), steer = byRole("steer");
   log(`現在の割り当て — 駆動: ${drive.length ? drive.map(portLabel).join(", ") : "なし"}`
+      + (rev.length ? ` / 駆動（反転）: ${rev.map(portLabel).join(", ")}` : "")
       + ` / ステアリング: ${steer.length ? steer.map(portLabel).join(", ") : "なし"}`
-      + ` / 制御方式: ${cfg.steerMode === "position" ? "角度指定" : "出力指定"}`);
+      + ` / 制御方式: ${cfg.steerMode === "position" ? "角度指定" : "出力指定"}`
+      + (cfg.reverse ? " / 前後反転: ON" : ""));
 }
 
 function portUsable(p){
@@ -1336,7 +1352,7 @@ function portUsable(p){
 
 function sendControl(throttle, steer){
   // ---- 駆動 ----
-  const power = Math.round(throttle * cfg.maxPower);
+  const power = Math.round(throttle * cfg.maxPower) * (cfg.reverse ? -1 : 1);
   if (lastDrive === null || Math.abs(power - lastDrive) >= 2 || (power === 0 && lastDrive !== 0)){
     for (const k of Object.keys(cfg.roles)){
       const role = cfg.roles[k];
@@ -1482,6 +1498,9 @@ $("cfgWriteMode").addEventListener("change", e => {
   cfg.writeMode = e.target.value; save();
   log("書き込み方式を「" + (cfg.writeMode === "without" ? "応答なし" : "応答あり") + "」に変更しました");
 });
+
+$("cfgReverse").checked = cfg.reverse;
+$("cfgReverse").addEventListener("change", e => { cfg.reverse = e.target.checked; save(); lastDrive = null; });
 
 $("cfgAutoReconnect").checked = cfg.autoReconnect;
 $("cfgAutoReconnect").addEventListener("change", e => { cfg.autoReconnect = e.target.checked; save(); });
