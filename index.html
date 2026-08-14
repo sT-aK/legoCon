@@ -82,6 +82,11 @@
     <div class="kv"><span>状態</span><span id="btState" class="pill off">未接続</span></div>
     <div class="kv"><span>バッテリー</span><span id="battery" class="mono">—</span></div>
     <div class="kv"><span>送信 / エラー</span><span id="txStat" class="mono">0 / 0</span></div>
+    <div class="kv"><span>切断回数 / 接続維持</span><span id="linkStat" class="mono">0 / —</span></div>
+    <label style="display:flex; align-items:center; gap:6px; margin:10px 0 0; color:var(--fg); font-size:14px">
+      <input type="checkbox" id="cfgAutoReconnect"> 切れたら自動で再接続し続ける
+    </label>
+    <p class="note" style="margin-top:6px">リンクが不安定な環境向けです。「切断」ボタンを押すまで再接続を試み続けます。</p>
   </div>
 </div>
 
@@ -283,7 +288,7 @@ const DEFAULTS = {
     brake: { kind:"button", index:6, rest:0, dir:1, span:1 },
     steer: { kind:"axis",   index:0, rest:0, dir:1, span:1 },
   },
-  driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
+  autoReconnect:true, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
   steerMode:"power", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
 };
@@ -317,6 +322,8 @@ let intentionalDisconnect = false; // 「切断」ボタンによる切断
 let selfDisconnect = false;        // やり直しのために自分で切断した
 let autoReconnects = 0;            // 自動再接続の実行回数
 let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
+let dropCount = 0;                 // 意図しない切断の回数
+let connectedSince = 0;            // 接続が確立した時刻
 let notifyWorking = false;         // ハブからの通知が受け取れているか
 let lastGotoTime = 0;              // 直近に角度指令を送った時刻
 let steerNeedsSub = true;          // 舵角の購読がまだなら true
@@ -751,6 +758,7 @@ async function connectOnce(attempt){
   notifyWorking = (result === "ok");
 
   connected = true;
+  connectedSince = performance.now();
   setConnUI(true);
   $("hubName").textContent = device.name || "(名前なし)";
   log(`接続完了 — 書き込み方式: ${cfg.writeMode === "without" ? "応答なし" : "応答あり"}`
@@ -916,6 +924,8 @@ $("reconnectBtn").addEventListener("click", async () => {
 
 $("disconnectBtn").addEventListener("click", async () => {
   intentionalDisconnect = true;
+  autoReconnects = 0;
+  connectedSince = 0;
   stopAll();
   setTimeout(() => { if (device && device.gatt.connected) device.gatt.disconnect(); }, 150);
 });
@@ -931,8 +941,16 @@ function onDisconnected(){
     return;
   }
   connected = false;
+  if (connectedSince){
+    dropCount++;
+    const held = ((performance.now() - connectedSince) / 1000).toFixed(1);
+    connectedSince = 0;
+    $("linkStat").textContent = `${dropCount} / ${held} 秒`;
+    log(`ハブとの接続が切れました（${held} 秒維持）`);
+  } else {
+    log("ハブとの接続が切れました");
+  }
   setConnUI(false);
-  log("ハブとの接続が切れました");
 
   if (cfg.steerMode === "position" && performance.now() - lastGotoTime < 2500){
     cfg.steerMode = "power"; save();
@@ -942,12 +960,15 @@ function onDisconnected(){
         "  ステアリングを「出力指定」に切り替えました。");
   }
 
-  // 意図しない切断なら一度だけ自動で張り直す。
-  // ハブが接続直後に落とす個体・環境があるため。
-  if (!intentionalDisconnect && device && autoReconnects < 2 && !connecting){
+  // リンクが不安定な環境では、切断のたびに手で押し直すのは現実的ではない。
+  // 「切断」ボタンを押すまで、間隔を空けながら再接続を試み続ける。
+  if (cfg.autoReconnect && !intentionalDisconnect && device && !connecting){
     autoReconnects++;
-    log(`自動で再接続します (${autoReconnects}/2)…`);
-    setTimeout(() => { if (device && !device.gatt.connected && !connecting) openHub(); }, 1000);
+    const wait = Math.min(1000 * autoReconnects, 3000);
+    $("btState").textContent = "再接続中…";
+    $("btState").className = "pill";
+    log(`自動で再接続します (${autoReconnects} 回目、${(wait/1000).toFixed(0)} 秒後)…`);
+    setTimeout(() => { if (cfg.autoReconnect && device && !device.gatt.connected && !connecting) openHub(); }, wait);
   }
 }
 
@@ -1362,6 +1383,9 @@ $("cfgWriteMode").addEventListener("change", e => {
   cfg.writeMode = e.target.value; save();
   log("書き込み方式を「" + (cfg.writeMode === "without" ? "応答なし" : "応答あり") + "」に変更しました");
 });
+
+$("cfgAutoReconnect").checked = cfg.autoReconnect;
+$("cfgAutoReconnect").addEventListener("change", e => { cfg.autoReconnect = e.target.checked; save(); });
 
 $("cfgHexLog").checked = cfg.hexLog;
 $("cfgHexLog").addEventListener("change", e => { cfg.hexLog = e.target.checked; save(); });
