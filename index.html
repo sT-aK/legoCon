@@ -305,6 +305,7 @@ let connected = false;
 let connecting = false;            // 接続シーケンス実行中
 let droppedDuringSetup = false;    // セットアップ中にハブ側から切断された
 let intentionalDisconnect = false; // 「切断」ボタンによる切断
+let selfDisconnect = false;        // やり直しのために自分で切断した
 let autoReconnects = 0;            // 自動再接続の実行回数
 let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
@@ -337,15 +338,28 @@ const hex = bytes => Array.from(bytes).map(b => b.toString(16).padStart(2, "0"))
    キューに通す。同じキー（ポート）の未送信コマンドは新しい値で
    上書きされるので、古い指示が溜まって遅延することがない。
    ============================================================ */
+// ブラウザは 1 デバイスにつき同時に 1 つの GATT 操作しか実行できない。
+// 重ねて発行すると "GATT operation already in progress" で失敗するため、
+// 探索・通知購読・書き込みを全てこの 1 本の列に通す。
+let gattChain = Promise.resolve();
+function gattOp(fn){
+  const next = gattChain.then(fn, fn);   // 直前の成否に関わらず順番に実行する
+  gattChain = next.then(() => {}, () => {});
+  return next;
+}
+
 // 実際の GATT 書き込み。設定した方式が使えなければ、もう一方に自動で落とす。
 // Windows の Chrome では writeValueWithoutResponse が無言で届かない例があるため、
 // 既定は応答あり（writeValue）にしてある。
-async function writeRaw(bytes){
+function rawWrite(bytes){
   const preferWithout = cfg.writeMode === "without";
   if (preferWithout && canWriteWithoutResponse) return characteristic.writeValueWithoutResponse(bytes);
   if (!preferWithout && canWrite) return characteristic.writeValue(bytes);
   if (canWriteWithoutResponse) return characteristic.writeValueWithoutResponse(bytes);
   return characteristic.writeValue(bytes);
+}
+function writeRaw(bytes){
+  return gattOp(() => rawWrite(bytes));
 }
 
 const pending = new Map();         // key -> { bytes, force }
@@ -588,16 +602,19 @@ const HELP_DROPPED =
 // 接続からハンドシェイクまでを 1 回分の試行として実行する。
 // 途中でハブに切断された場合は、この関数全体をやり直す必要がある。
 async function connectOnce(){
-  if (device.gatt.connected){
-    device.gatt.disconnect();
-    await sleep(400);                 // OS が接続を解放するのを待つ
-  }
+  // 前の接続が残っていると次の connect() が "Connection already in progress" になる。
+  // 切断済みに見えてもブラウザ側の後始末が終わっていないことがあるので、必ず一度切ってから待つ。
+  selfDisconnect = true;
+  try { device.gatt.disconnect(); } catch {}
+  await sleep(600);
+  selfDisconnect = false;
+
   const server = await device.gatt.connect();
 
-  // ここで待たない。LEGO ハブは接続後に何もしないと切ってしまうことがあるので、
+  // 接続後に待たない。LEGO ハブは無操作の時間があると切ってしまうことがあるので、
   // 探索と購読をできるだけ早く済ませる。
-  const service = await withRetry("サービス取得", () => server.getPrimaryService(LWP3_SERVICE));
-  characteristic = await withRetry("キャラクタリスティック取得", () => service.getCharacteristic(LWP3_CHAR));
+  const service = await withRetry("サービス取得", () => gattOp(() => server.getPrimaryService(LWP3_SERVICE)));
+  characteristic = await withRetry("キャラクタリスティック取得", () => gattOp(() => service.getCharacteristic(LWP3_CHAR)));
 
   const props = characteristic.properties;
   canWriteWithoutResponse =
@@ -606,7 +623,7 @@ async function connectOnce(){
   canWrite = !props || !!props.write;
 
   try {
-    await withRetry("通知の購読", () => characteristic.startNotifications());
+    await withRetry("通知の購読", () => gattOp(() => characteristic.startNotifications()), 2, 800);
     characteristic.removeEventListener("characteristicvaluechanged", onNotify);
     characteristic.addEventListener("characteristicvaluechanged", onNotify);
   } catch (e){
@@ -614,9 +631,16 @@ async function connectOnce(){
     log("通知の購読に失敗（角度フィードバックなしで続行）: " + e.message);
   }
 
-  connected = true; armed = false;
+  armed = false;
   steerCenter = null; steerActual = null;
   txCount = 0; errCount = 0; rxCount = 0; consecutiveErrors = 0;
+
+  // 機種 ID を要求し、応答が返ることで通信の成立を確認する。
+  // ここを通るまで connected を立てない。立てると制御ループが書き込みを始めてしまい、
+  // ハンドシェイクの書き込みと GATT 操作が衝突する。
+  if (!await handshake()) throw new Error("ハブが応答しません");
+
+  connected = true;
   setConnUI(true);
   $("hubName").textContent = device.name || "(名前なし)";
   log(`接続完了 — 書き込み方式: ${cfg.writeMode === "without" ? "応答なし" : "応答あり"}`
@@ -624,9 +648,6 @@ async function connectOnce(){
 
   applyRoles();
   requestWakeLock();
-
-  // 機種 ID を要求し、応答が返ることで通信の成立を確認する。
-  if (!await handshake()) throw new Error("ハブが応答しません");
   return true;
 }
 
@@ -654,7 +675,7 @@ async function openHub(){
       } catch (e){
         connected = false;
         log(`接続に失敗 (${attempt}/4): ${(e && e.message) || e}`);
-        if (attempt < 4) await sleep(700 * attempt);
+        if (attempt < 4) await sleep(1000 * attempt);
       }
     }
     log("⚠ 接続できませんでした。\n" + (droppedDuringSetup ? HELP_DROPPED : HELP_NO_RESPONSE));
@@ -731,6 +752,7 @@ $("disconnectBtn").addEventListener("click", async () => {
 
 function onDisconnected(){
   characteristic = null; pending.clear();
+  if (selfDisconnect) return;        // やり直しのために自分で切ったもの
   if (connecting){
     // セットアップ中の切断。openHub 側が接続からやり直すので、ここでは記録だけ。
     droppedDuringSetup = true;
