@@ -130,7 +130,7 @@
     <thead><tr><th style="width:56px">ポート</th><th>検出されたデバイス</th><th style="width:150px">役割</th></tr></thead>
     <tbody id="portTable"></tbody>
   </table>
-  <p class="note">ハブを接続すると、実際に接続されているモーターが自動で表示されます。42176 ポルシェの初期値は A・B = 駆動、C = ステアリングです。実機と違う場合はここで変更してください。</p>
+  <p class="note">ハブを接続すると、そのハブが持つポートと接続されているデバイスが自動で表示されます。内蔵モーターの番号は機種によって異なり、Technic Move Hub では 50 番以降に並びます。どれが駆動でどれがステアリングかは、診断の「ポートスキャン」で実機を動かして確かめてください。</p>
 </div>
 
 <!-- 調整 -->
@@ -256,6 +256,8 @@ const LWP3_SERVICE = "00001623-1212-efde-1623-785feabcd123";
 const LWP3_CHAR    = "00001624-1212-efde-1623-785feabcd123";
 
 const PORT_NAMES = { 0:"A", 1:"B", 2:"C", 3:"D" };
+// A〜D 以外（ハブ内蔵デバイスなど）は番号で表す
+const portLabel = p => PORT_NAMES[p] || `${p} (0x${Number(p).toString(16).padStart(2,"0")})`;
 
 // Hub Attached I/O で通知される代表的なデバイス種別
 const IO_TYPES = {
@@ -266,6 +268,7 @@ const IO_TYPES = {
   0x002E:"Technic Large Motor", 0x002F:"Technic XL Motor",
   0x0030:"Technic Medium Angular Motor", 0x0031:"Technic Large Angular Motor",
   0x004B:"Technic Medium Angular Motor", 0x004C:"Technic Large Angular Motor",
+  0x0039:"Accelerometer", 0x003A:"Gyro Sensor", 0x003B:"Tilt Sensor", 0x003C:"Temperature Sensor",
 };
 // 一覧にない ID は 16 進数のまま表示する（機種固有の内蔵モーターなど）
 
@@ -324,6 +327,7 @@ let steerCenter = null;            // センターとみなす角度（POS カ�
 let steerActual = null;            // 実測角度
 let steerSubTime = 0;              // 角度通知を要求した時刻（フォールバック判定用）
 const detected = {};               // portId -> デバイス名
+const detectedType = {};           // portId -> IO 型 ID
 const lastSent = {};               // key -> { value, time }
 
 const $ = id => document.getElementById(id);
@@ -507,16 +511,17 @@ function onNotify(event){
   if (type === 0x04){                                   // Hub Attached I/O
     const port = d[3], ev = d[4];
     if (ev === 0){
-      delete detected[port];
-      log(`ポート ${PORT_NAMES[port] ?? port}: 取り外し`);
+      delete detected[port]; delete detectedType[port];
+      log(`ポート ${portLabel(port)}: 取り外し`);
     } else {
       const ioType = d[5] | (d[6] << 8);
       const name = IO_TYPES[ioType] || `不明 (0x${ioType.toString(16).padStart(4,"0")})`;
-      detected[port] = name;
-      log(`ポート ${PORT_NAMES[port] ?? port}: ${name}`);
+      detected[port] = name; detectedType[port] = ioType;
+      log(`ポート ${portLabel(port)}: ${name}`);
       if (port === steerPort) subscribeSteer();
     }
     renderPorts();
+    renderTestPorts();
 
   } else if (type === 0x45){                            // Port Value (Single)
     const port = d[3];
@@ -541,7 +546,7 @@ function onNotify(event){
     }
 
   } else if (type === 0x82){                            // Port Output Command Feedback
-    if (cfg.hexLog) log(`ポート ${PORT_NAMES[d[3]] ?? d[3]}: コマンド受理 (0x${d[4].toString(16)})`);
+    if (cfg.hexLog) log(`ポート ${portLabel(d[3])}: コマンド受理 (0x${d[4].toString(16)})`);
 
   } else if (type === 0x05){                            // Generic Error
     const codes = {
@@ -555,6 +560,7 @@ function onNotify(event){
 
 function subscribeSteer(){
   if (steerPort === null || cfg.steerMode !== "position") return;
+  if (!portUsable(steerPort)) return;
   steerCenter = null;
   steerSubTime = performance.now();
   queueCommand("sub" + steerPort, cmdSubscribe(steerPort, 2, 2), true); // mode 2 = POS
@@ -761,8 +767,23 @@ async function openHub(){
         queueCommand("battery", CMD_BATTERY_SUB, true);
         const gen = ++connectGen;
         setTimeout(() => {
-          if (gen === connectGen && connected && notifyWorking && Object.keys(detected).length === 0){
+          if (gen !== connectGen || !connected || !notifyWorking) return;
+          const found = Object.keys(detected).map(Number);
+          if (found.length === 0){
             log("⚠ モーターが 1 つも検出されていません。診断の「ポートスキャン」でどのポートが動くか確認してください。");
+            return;
+          }
+          const assigned = Object.keys(cfg.roles)
+            .filter(k => cfg.roles[k] !== "none")
+            .map(Number);
+          const stale = assigned.filter(p => !found.includes(p));
+          if (stale.length){
+            // 別の機種向けの設定が残っている。送っても弾かれるだけなので外す。
+            for (const p of stale) cfg.roles[p] = "none";
+            save(); applyRoles(); renderPorts();
+            log(`⚠ 実機に存在しないポート（${stale.map(portLabel).join(", ")}）の割り当てを解除しました。\n` +
+                `  このハブが持つポート: ${found.map(portLabel).join(", ")}\n` +
+                "  診断の「ポートスキャン」でどのポートが動くか確かめ、「ポート割り当て」で設定してください。");
           }
         }, 2000);
         return true;
@@ -910,7 +931,7 @@ function setConnUI(on){
   if (!on){
     $("hubName").textContent = "—";
     $("battery").textContent = "—";
-    for (const k of Object.keys(detected)) delete detected[k];
+    for (const k of Object.keys(detected)){ delete detected[k]; delete detectedType[k]; }
     renderPorts();
     setArmed(false);
   }
@@ -919,14 +940,25 @@ function setConnUI(on){
 /* ============================================================
    ポート割り当て UI
    ============================================================ */
+// 表に出すポート: 外部ポート A〜D + 実際に検出されたポート + 役割が設定済みのポート。
+// Technic Move Hub のように内蔵デバイスが 50 番以降に並ぶ機種があるので、
+// 固定リストでは足りない。
+function listedPorts(){
+  const found = Object.keys(detected).map(Number);
+  // 実機の構成が分かっているなら、存在しないポートを並べても意味がない
+  const set = new Set(found.length ? found : [0, 1, 2, 3]);
+  for (const k of Object.keys(cfg.roles)) if (cfg.roles[k] !== "none") set.add(Number(k));
+  return [...set].sort((a, b) => a - b);
+}
+
 function renderPorts(){
   const tbody = $("portTable");
   tbody.innerHTML = "";
-  for (const p of [0,1,2,3]){
+  for (const p of listedPorts()){
     const tr = document.createElement("tr");
 
     const tdPort = document.createElement("td");
-    tdPort.innerHTML = `<strong>${PORT_NAMES[p]}</strong>`;
+    tdPort.innerHTML = `<strong>${portLabel(p)}</strong>`;
     tr.appendChild(tdPort);
 
     const tdDev = document.createElement("td");
@@ -941,12 +973,12 @@ function renderPorts(){
     for (const [val, label] of [["none","使わない"],["drive","駆動"],["drive_rev","駆動（反転）"],["steer","ステアリング"]]){
       const o = document.createElement("option");
       o.value = val; o.textContent = label;
-      if (cfg.roles[p] === val) o.selected = true;
+      if ((cfg.roles[p] || "none") === val) o.selected = true;
       sel.appendChild(o);
     }
     sel.addEventListener("change", () => {
       if (sel.value === "steer"){
-        for (const q of [0,1,2,3]) if (q !== p && cfg.roles[q] === "steer") cfg.roles[q] = "none";
+        for (const q of Object.keys(cfg.roles)) if (Number(q) !== p && cfg.roles[q] === "steer") cfg.roles[q] = "none";
       }
       cfg.roles[p] = sel.value;
       save(); applyRoles(); renderPorts();
@@ -961,7 +993,7 @@ function renderPorts(){
 function applyRoles(){
   const prev = steerPort;
   steerPort = null;
-  for (const p of [0,1,2,3]) if (cfg.roles[p] === "steer") steerPort = p;
+  for (const k of Object.keys(cfg.roles)) if (cfg.roles[k] === "steer") steerPort = Number(k);
   if (steerPort !== prev){
     steerActual = null; steerCenter = null;
     if (prev !== null && connected) queueCommand("p" + prev, cmdPower(prev, 0), true);
@@ -1140,13 +1172,20 @@ function loop(){
   requestAnimationFrame(loop);
 }
 
+// 検出が効いているのに存在しないポートへ送っても、ハブがエラーを返すだけ。
+function portUsable(p){
+  return !notifyWorking || Object.keys(detected).length === 0 || !!detected[p];
+}
+
 function sendControl(throttle, steer){
   // ---- 駆動 ----
   const power = Math.round(throttle * cfg.maxPower);
   if (lastDrive === null || Math.abs(power - lastDrive) >= 2 || (power === 0 && lastDrive !== 0)){
-    for (const p of [0,1,2,3]){
-      const role = cfg.roles[p];
+    for (const k of Object.keys(cfg.roles)){
+      const role = cfg.roles[k];
       if (role !== "drive" && role !== "drive_rev") continue;
+      const p = Number(k);
+      if (!portUsable(p)) continue;
       queueCommand("p" + p, cmdDrive(p, role === "drive_rev" ? -power : power), power === 0);
     }
     lastDrive = power;
@@ -1154,7 +1193,7 @@ function sendControl(throttle, steer){
   }
 
   // ---- ステアリング ----
-  if (steerPort === null) return;
+  if (steerPort === null || !portUsable(steerPort)) return;
   if (cfg.steerMode === "position"){
     // 角度通知が来ない環境（通知未対応など）では 1.5 秒後に 0 をセンターとみなす
     if (steerCenter === null && performance.now() - steerSubTime > 1500){
@@ -1196,9 +1235,9 @@ function stopAll(){
   setArmed(false);
   if (!characteristic) return;
   pending.clear();
-  for (const p of [0,1,2,3]){
-    if (cfg.roles[p] === "none") continue;
-    queueCommand("p" + p, cmdPower(p, 0), true);
+  for (const k of Object.keys(cfg.roles)){
+    if (cfg.roles[k] === "none") continue;
+    queueCommand("p" + k, cmdPower(Number(k), 0), true);
   }
   if (steerPort !== null) queueCommand("s" + steerPort, cmdPower(steerPort, 0), true);
   log("停止");
@@ -1289,7 +1328,21 @@ $("calibBtn").addEventListener("click", () => {
    診断
    ============================================================ */
 const TEST_PORTS = [0, 1, 2, 3, 4, 5];
-const testPortName = p => PORT_NAMES[p] || String.fromCharCode(65 + p);
+
+// スキャン対象: 検出できたポートがあればそれを使う。
+// 機種によって内蔵モーターの番号が違うので、決め打ちでは当たらない。
+// 電圧・電流・各種センサー・LED はモーターではないので回しても無駄。
+const NON_MOTOR_TYPES = new Set([
+  0x0005, 0x0008, 0x0014, 0x0015, 0x0016, 0x0017, 0x0022, 0x0023, 0x0024,
+  0x0027, 0x0039, 0x003A, 0x003B, 0x003C,
+]);
+
+function scanPorts(){
+  const found = Object.keys(detected).map(Number)
+    .filter(p => !NON_MOTOR_TYPES.has(detectedType[p]))
+    .sort((a, b) => a - b);
+  return found.length ? found : TEST_PORTS;
+}
 
 // テスト用の直接送信（キューのレート制限を通さず、確実に順番どおり送る）
 async function writeNow(bytes){
@@ -1366,8 +1419,8 @@ $("scanBtn").addEventListener("click", async () => {
   $("scanBtn").disabled = true;
   log("ポートスキャン開始 — どのポートで何が動くか見てください");
   try {
-    for (const p of TEST_PORTS){
-      log(`ポート ${testPortName(p)} を +50% で 0.6 秒…`);
+    for (const p of scanPorts()){
+      log(`ポート ${portLabel(p)} を +50% で 0.6 秒…`);
       await pulsePort(p, 50, 600);
       await sleep(400);
     }
@@ -1386,7 +1439,7 @@ $("testBtn").addEventListener("click", async () => {
   const port = parseInt($("testPort").value, 10);
   const power = parseInt($("testPower").value, 10);
   try {
-    log(`ポート ${testPortName(port)} を ${power}% で 1 秒`);
+    log(`ポート ${portLabel(port)} を ${power}% で 1 秒`);
     await pulsePort(port, power, 1000);
   } finally {
     testing = false;
@@ -1395,11 +1448,18 @@ $("testBtn").addEventListener("click", async () => {
   }
 });
 
-for (const p of TEST_PORTS){
-  const o = document.createElement("option");
-  o.value = p; o.textContent = "ポート " + testPortName(p);
-  $("testPort").appendChild(o);
+function renderTestPorts(){
+  const sel = $("testPort");
+  const keep = sel.value;
+  sel.innerHTML = "";
+  for (const p of scanPorts()){
+    const o = document.createElement("option");
+    o.value = p; o.textContent = "ポート " + portLabel(p);
+    sel.appendChild(o);
+  }
+  if (keep) sel.value = keep;
 }
+renderTestPorts();
 
 /* ============================================================
    起動時チェック
