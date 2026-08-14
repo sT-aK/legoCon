@@ -318,6 +318,7 @@ let selfDisconnect = false;        // やり直しのために自分で切断し
 let autoReconnects = 0;            // 自動再接続の実行回数
 let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
 let notifyWorking = false;         // ハブからの通知が受け取れているか
+let lastGotoTime = 0;              // 直近に角度指令を送った時刻
 let holdTest = false;              // 接続保持テストの実行中
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
@@ -550,11 +551,20 @@ function onNotify(event){
 
   } else if (type === 0x05){                            // Generic Error
     const codes = {
-      0x01:"ACK", 0x02:"MACK", 0x03:"バッファ満杯", 0x04:"タイムアウト",
-      0x05:"コマンド未認識", 0x06:"パケット長が不正", 0x07:"パラメーター値が不正",
-      0x08:"コマンドが許可されていない", 0x09:"未初期化", 0x0A:"実行できない状態",
+      0x01:"ACK", 0x02:"MACK", 0x03:"バッファオーバーフロー", 0x04:"タイムアウト",
+      0x05:"コマンド未対応", 0x06:"パラメーターが不正（存在しないポート・非対応の指令など）",
+      0x07:"過電流", 0x08:"内部エラー",
     };
     log(`ハブがエラーを返しました: command 0x${d[3].toString(16)} → ${codes[d[4]] || "0x" + d[4].toString(16)}`);
+
+    if (d[3] === 0x81 && cfg.steerMode === "position" && performance.now() - lastGotoTime < 800){
+      cfg.steerMode = "power";
+      save();
+      $("cfgSteerMode").value = "power";
+      lastSteer = null;
+      log("→ このモーターは角度指定に対応していないようです。ステアリングを「出力指定」に切り替えました。\n" +
+          "  端当てを避けるため「ステア最大トルク」を低め（30〜50%）にしてください。");
+    }
   }
 }
 
@@ -751,6 +761,9 @@ async function connectOnce(attempt){
 }
 
 async function openHub(){
+  // 二重起動を許すと、片方が disconnect している裏でもう片方が接続を張り、
+  // 互いを切断し合う悪循環になる。
+  if (connecting){ log("接続処理が既に進行中です"); return false; }
   connecting = true;
   droppedDuringSetup = false;
   intentionalDisconnect = false;
@@ -800,6 +813,7 @@ async function openHub(){
     return false;
   } finally {
     connecting = false;
+    $("connectBtn").disabled = connected;
   }
 }
 
@@ -829,6 +843,7 @@ async function handshake(){
 }
 
 $("connectBtn").addEventListener("click", async () => {
+  if (connecting){ log("接続処理が進行中です。完了までお待ちください"); return; }
   if (!navigator.bluetooth){
     alert("このブラウザは Web Bluetooth に対応していません。iOS では Bluefy、PC では Chrome / Edge をお使いください。");
     return;
@@ -876,6 +891,7 @@ $("connectBtn").addEventListener("click", async () => {
 
 // 一度選んだデバイスには、選択ダイアログを出さずに接続し直せる。
 $("reconnectBtn").addEventListener("click", async () => {
+  if (connecting){ log("接続処理が進行中です。完了までお待ちください"); return; }
   if (!device){ log("先に一度「LEGO Hub に接続」を実行してください"); return; }
   $("reconnectBtn").disabled = true;
   try {
@@ -910,7 +926,7 @@ function onDisconnected(){
 
   // 意図しない切断なら一度だけ自動で張り直す。
   // ハブが接続直後に落とす個体・環境があるため。
-  if (!intentionalDisconnect && device && autoReconnects < 2){
+  if (!intentionalDisconnect && device && autoReconnects < 2 && !connecting){
     autoReconnects++;
     log(`自動で再接続します (${autoReconnects}/2)…`);
     setTimeout(() => { if (device && !device.gatt.connected && !connecting) openHub(); }, 1000);
@@ -919,7 +935,7 @@ function onDisconnected(){
 
 function setConnUI(on){
   connected = on;
-  $("connectBtn").disabled = on;
+  $("connectBtn").disabled = on || connecting;
   $("disconnectBtn").disabled = !on;
   $("reconnectBtn").disabled = !device;
   $("calibBtn").disabled = !on;
@@ -1206,6 +1222,7 @@ function sendControl(throttle, steer){
     }
     const target = Math.round(steer * cfg.steerAngle + cfg.trim);
     if (lastSteer === null || Math.abs(target - lastSteer) >= 2 || (target === 0 && lastSteer !== 0)){
+      lastGotoTime = performance.now();
       queueCommand("s" + steerPort, cmdGoto(steerPort, steerCenter + target, 100, cfg.steerPower), false);
       lastSteer = target;
       $("outSteerTarget").textContent = target + " °";
