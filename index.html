@@ -421,7 +421,7 @@ async function drain(){
           noteGattError(e);
           errCount++; consecutiveErrors++;
           if (consecutiveErrors === 1 || consecutiveErrors === 10){
-            log("送信エラー: " + (e && e.message ? e.message : e));
+            log("送信エラー: " + describeError(e));
           }
           if (consecutiveErrors === 10) log(HELP_NO_RESPONSE);
         }
@@ -594,7 +594,7 @@ async function withRetry(label, fn, attempts = 3, delay = 400){
     catch (e){
       lastErr = e;
       if (!isTransientGattError(e) || isDisconnectedError(e)) throw e;
-      log(`${label}: 一時エラーのため再試行 ${i}/${attempts} — ${e.message}`);
+      log(`${label}: 一時エラーのため再試行 ${i}/${attempts} — ${describeError(e)}`);
       await sleep(delay * i);
     }
   }
@@ -607,6 +607,37 @@ const HELP_NO_RESPONSE =
   "2. LEGO 公式アプリなど、ハブに接続する他のアプリを終了する\n" +
   "3. OS の Bluetooth 設定にハブが登録されていたら削除する\n" +
   "4. ハブの電源を入れ直し、緑点滅の状態で接続し直す";
+
+// Bluefy などは message に数値だけを入れてくることがある。
+// 種別・メッセージ・生の文字列化を全て残さないと原因が追えない。
+function describeError(e){
+  if (e === null || e === undefined) return "不明なエラー";
+  const parts = [];
+  if (e.name) parts.push(e.name);
+  if (e.code !== undefined) parts.push("code=" + e.code);
+  const msg = (e.message === undefined || e.message === "") ? String(e) : e.message;
+  parts.push(msg);
+  return parts.join(" / ");
+}
+
+// requestDevice の受け付け方はブラウザ差が大きい。
+// 厳しい絞り込みから順に試し、成功した方法を次回以降の既定にする。
+const SCAN_STRATEGIES = [
+  { name: "サービス UUID で絞り込み",
+    opts: { filters: [{ services: [LWP3_SERVICE] }] } },
+  { name: "名前で絞り込み",
+    opts: { filters: [{ namePrefix: "Technic" }, { namePrefix: "LEGO" },
+                      { namePrefix: "Move" }, { namePrefix: "Hub" }],
+            optionalServices: [LWP3_SERVICE] } },
+  { name: "すべてのデバイスを表示",
+    opts: { acceptAllDevices: true, optionalServices: [LWP3_SERVICE] } },
+];
+let scanIndex = 0;
+
+function isUserCancel(e){
+  return !!e && (e.name === "NotFoundError" || e.name === "AbortError") &&
+         /cancel|user|chooser/i.test((e.message || "") + (e.name || ""));
+}
 
 const HELP_IN_PROGRESS =
   "ブラウザが「このデバイスへの接続処理が既に進行中」と言っています。\n" +
@@ -641,7 +672,7 @@ async function trySubscribe(){
   } catch (e){
     noteGattError(e);
     if (isDisconnectedError(e)) throw e;
-    log("通知の購読に失敗: " + e.message);
+    log("通知の購読に失敗: " + describeError(e));
     return false;
   }
 }
@@ -738,7 +769,7 @@ async function openHub(){
       } catch (e){
         noteGattError(e);
         connected = false;
-        log(`接続に失敗 (${attempt}/4): ${(e && e.message) || e}`);
+        log(`接続に失敗 (${attempt}/4): ${describeError(e)}`);
         if (attempt < 4) await sleep(1000 * attempt);
       }
     }
@@ -761,7 +792,7 @@ async function handshake(){
       wroteOk = true;
     } catch (e){
       noteGattError(e);
-      log(`ハンドシェイク送信に失敗 (${i}/3): ${e.message}`);
+      log(`ハンドシェイク送信に失敗 (${i}/3): ${describeError(e)}`);
       await sleep(500);
       continue;
     }
@@ -781,22 +812,43 @@ $("connectBtn").addEventListener("click", async () => {
     alert("このブラウザは Web Bluetooth に対応していません。iOS では Bluefy、PC では Chrome / Edge をお使いください。");
     return;
   }
+  $("connectBtn").disabled = true;
   try {
-    $("connectBtn").disabled = true;
-    log("デバイスを検索中…");
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [LWP3_SERVICE] }],
-      optionalServices: [LWP3_SERVICE],
-    });
+    let picked = null, lastErr = null;
+
+    for (let i = scanIndex; i < SCAN_STRATEGIES.length; i++){
+      const s = SCAN_STRATEGIES[i];
+      try {
+        log(`デバイスを検索中…（${s.name}）`);
+        picked = await navigator.bluetooth.requestDevice(s.opts);
+        scanIndex = i;                 // 通った方法を次回の既定にする
+        break;
+      } catch (e){
+        lastErr = e;
+        if (isUserCancel(e)){ log("デバイス選択がキャンセルされました"); setConnUI(false); return; }
+        log(`検索に失敗（${s.name}）: ${describeError(e)}`);
+        if (i + 1 < SCAN_STRATEGIES.length){
+          scanIndex = i + 1;           // 次回はこの方法から始める
+          log(`「${SCAN_STRATEGIES[i + 1].name}」で試します…`);
+        }
+      }
+    }
+
+    if (!picked){
+      log("⚠ デバイスを選択できませんでした。\n" +
+          "  ハブが緑点滅（待ち受け）になっているか確認し、もう一度ボタンを押してください。\n" +
+          "  ブラウザによっては、続けて検索し直すのにボタンの押し直しが必要です。");
+      if (lastErr) log("最後のエラー: " + describeError(lastErr));
+      setConnUI(false);
+      return;
+    }
+
+    device = picked;
     device.removeEventListener("gattserverdisconnected", onDisconnected);
     device.addEventListener("gattserverdisconnected", onDisconnected);
     await openHub();
   } catch (e){
-    if (e && (e.name === "NotFoundError" || e.name === "AbortError")){
-      log("デバイス選択がキャンセルされました");
-    } else {
-      log("接続失敗: " + (e && e.message ? e.message : e));
-    }
+    log("接続失敗: " + describeError(e));
     setConnUI(false);
   }
 });
@@ -808,7 +860,7 @@ $("reconnectBtn").addEventListener("click", async () => {
   try {
     await openHub();
   } catch (e){
-    log("再接続に失敗: " + (e && e.message ? e.message : e));
+    log("再接続に失敗: " + describeError(e));
     setConnUI(false);
   } finally {
     $("reconnectBtn").disabled = false;
@@ -1248,7 +1300,7 @@ async function writeNow(bytes){
     if (cfg.hexLog) log("TX " + hex(bytes));
   } catch (e){
     errCount++;
-    log("送信エラー: " + (e && e.message ? e.message : e));
+    log("送信エラー: " + describeError(e));
   }
   $("txStat").textContent = `${txCount} / ${errCount}`;
 }
@@ -1287,7 +1339,7 @@ $("holdBtn").addEventListener("click", async () => {
     log("✓ 10 秒間、接続は維持されました。\n" +
         "  → 接続そのものは成立します。切断はこちらの GATT 操作がきっかけです。");
   } catch (e){
-    log("接続保持テストに失敗: " + ((e && e.message) || e));
+    log("接続保持テストに失敗: " + describeError(e));
   } finally {
     try { device.gatt.disconnect(); } catch {}
     holdTest = false;
