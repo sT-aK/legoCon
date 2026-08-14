@@ -205,9 +205,15 @@
   <h2>診断</h2>
   <p class="note" style="margin-top:0">コントローラーと切り離して、ハブとの通信だけを確かめられます。動かないときはここから。</p>
   <div class="row">
+    <button id="holdBtn" class="ghost" disabled>接続保持テスト</button>
     <button id="pingBtn" class="ghost" disabled>ハブ情報を要求</button>
     <button id="scanBtn" class="ghost" disabled>ポートスキャン (A〜F)</button>
   </div>
+  <p class="note" style="margin-top:6px">
+    <strong>接続保持テスト</strong>は、接続だけして GATT 操作を一切行わず 10 秒観察します。
+    bluetooth-internals の Connect と同じ条件です。ここで維持されるなら切断のきっかけはこちらの操作側、
+    維持されないなら接続そのものが成立していません。
+  </p>
   <div style="margin-top:12px">
     <label>書き込み方式</label>
     <select id="cfgWriteMode">
@@ -309,6 +315,7 @@ let selfDisconnect = false;        // やり直しのために自分で切断し
 let autoReconnects = 0;            // 自動再接続の実行回数
 let connectGen = 0;                // 接続の世代（古いタイマーの発火を無視するため）
 let notifyWorking = false;         // ハブからの通知が受け取れているか
+let holdTest = false;              // 接続保持テストの実行中
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
 let testing = false;               // 診断テスト中は通常の制御出力を止める
@@ -353,6 +360,7 @@ function gattOp(fn){
 // Windows の Chrome では writeValueWithoutResponse が無言で届かない例があるため、
 // 既定は応答あり（writeValue）にしてある。
 function rawWrite(bytes){
+  if (!characteristic) throw new Error("未接続です");
   const preferWithout = cfg.writeMode === "without";
   if (preferWithout && canWriteWithoutResponse) return characteristic.writeValueWithoutResponse(bytes);
   if (!preferWithout && canWrite) return characteristic.writeValue(bytes);
@@ -642,10 +650,14 @@ async function connectOnce(attempt){
   // 前の接続が残っていると次の connect() が "Connection already in progress" になる。
   // 切断済みに見えてもブラウザ側の後始末が終わっていないことがあるので、
   // 必ず一度切って待つ。待ち時間は回を追うごとに長くする。
-  selfDisconnect = true;
-  try { device.gatt.disconnect(); } catch {}
-  await sleep(600 * attempt);
-  selfDisconnect = false;
+  if (device.gatt.connected){
+    selfDisconnect = true;
+    try { device.gatt.disconnect(); } catch {}
+    await sleep(600 * attempt);
+    selfDisconnect = false;
+  } else if (attempt > 1){
+    await sleep(600 * attempt);      // 前回の後始末が終わるのを待つ
+  }
 
   const server = await device.gatt.connect();
 
@@ -680,6 +692,8 @@ async function connectOnce(attempt){
   }
 
   if (result === "fail") throw new Error("ハブに書き込めません");
+  // ハンドシェイク中に切られていることがある。切れたまま接続完了にはしない。
+  if (!device.gatt.connected) throw new Error("ハブに切断されました");
   notifyWorking = (result === "ok");
 
   connected = true;
@@ -809,6 +823,7 @@ $("disconnectBtn").addEventListener("click", async () => {
 
 function onDisconnected(){
   characteristic = null; pending.clear();
+  if (holdTest) return;              // 接続保持テストが自分で観測している
   if (selfDisconnect) return;        // やり直しのために自分で切ったもの
   if (connecting){
     // セットアップ中の切断。openHub 側が接続からやり直すので、ここでは記録だけ。
@@ -836,6 +851,7 @@ function setConnUI(on){
   $("reconnectBtn").disabled = !device;
   $("calibBtn").disabled = !on;
   for (const id of ["pingBtn", "scanBtn", "testBtn"]) $(id).disabled = !on;
+  $("holdBtn").disabled = !device;
   const s = $("btState");
   s.textContent = on ? "接続中" : "未接続";
   s.className = "pill " + (on ? "on" : "off");
@@ -1242,6 +1258,42 @@ async function pulsePort(port, power, ms){
   await sleep(ms);
   await writeNow(cmdPower(port, 0));
 }
+
+// GATT 操作を一切行わずに接続だけ張り、維持されるかを観察する。
+// bluetooth-internals の Connect と同じ条件を作って比較するための診断。
+$("holdBtn").addEventListener("click", async () => {
+  if (!device){ log("先に一度「LEGO Hub に接続」でデバイスを選んでください"); return; }
+  if (holdTest) return;
+  holdTest = true;
+  $("holdBtn").disabled = true;
+  try {
+    log("接続保持テスト: GATT 操作を一切行わず 10 秒観察します");
+    try { device.gatt.disconnect(); } catch {}
+    await sleep(1000);
+
+    const t0 = performance.now();
+    await device.gatt.connect();
+    log("接続しました。観察開始…");
+
+    for (let i = 0; i < 40; i++){
+      await sleep(250);
+      if (!device.gatt.connected){
+        const secs = ((performance.now() - t0) / 1000).toFixed(1);
+        log(`⚠ ${secs} 秒で切断されました。こちらからは何も送っていません。\n` +
+            "  → 切断はページの GATT 操作とは無関係です。ハブ・アダプタ・電池・距離を確認してください。");
+        return;
+      }
+    }
+    log("✓ 10 秒間、接続は維持されました。\n" +
+        "  → 接続そのものは成立します。切断はこちらの GATT 操作がきっかけです。");
+  } catch (e){
+    log("接続保持テストに失敗: " + ((e && e.message) || e));
+  } finally {
+    try { device.gatt.disconnect(); } catch {}
+    holdTest = false;
+    $("holdBtn").disabled = !device;
+  }
+});
 
 $("pingBtn").addEventListener("click", async () => {
   const before = rxCount;
