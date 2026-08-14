@@ -147,6 +147,13 @@
   <h2>4. 走行設定</h2>
   <div class="grid">
     <div>
+      <label>駆動コマンド方式</label>
+      <select id="cfgDriveCmd">
+        <option value="power">パワー直接指定 (WriteDirectModeData)</option>
+        <option value="speed">速度指定 (StartSpeed)</option>
+      </select>
+    </div>
+    <div>
       <label>最大出力 <span id="lblMaxPower" class="mono"></span></label>
       <input type="range" id="cfgMaxPower" min="10" max="100" step="5">
     </div>
@@ -204,6 +211,40 @@
 <p class="note" style="text-align:center">コントローラーの B ボタン / キーボードの Space でも停止します。</p>
 
 <div class="card" style="margin-top:12px">
+  <h2>診断</h2>
+  <p class="note" style="margin-top:0">コントローラーと切り離して、ハブとの通信だけを確かめられます。動かないときはここから。</p>
+  <div class="row">
+    <button id="pingBtn" class="ghost" disabled>ハブ情報を要求</button>
+    <button id="scanBtn" class="ghost" disabled>ポートスキャン (A〜F)</button>
+  </div>
+  <div style="margin-top:12px">
+    <label>書き込み方式</label>
+    <select id="cfgWriteMode">
+      <option value="with">応答あり — writeValue（確実。まずはこちら）</option>
+      <option value="without">応答なし — writeValueWithoutResponse（低遅延）</option>
+    </select>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <select id="testPort" style="width:auto; flex:0 0 90px"></select>
+    <select id="testPower" style="width:auto; flex:0 0 110px">
+      <option value="30">出力 30%</option>
+      <option value="50" selected>出力 50%</option>
+      <option value="100">出力 100%</option>
+      <option value="-50">出力 -50%</option>
+    </select>
+    <button id="testBtn" class="ghost" disabled>1 秒だけ回す</button>
+  </div>
+  <label style="display:flex; align-items:center; gap:6px; margin:12px 0 0; color:var(--fg); font-size:14px">
+    <input type="checkbox" id="cfgHexLog"> 送受信パケットを 16 進数でログに出す
+  </label>
+  <p class="note">
+    「ハブ情報を要求」で機種名やファームウェアが返ってくれば、<strong>送信・受信の両方が成立しています</strong>。
+    その状態でモーターが動かない場合はポート番号かコマンド方式の問題です。「ポートスキャン」で
+    A〜F を順に短く回して、どのポートに何が付いているかを実機で確認してください。
+  </p>
+</div>
+
+<div class="card" style="margin-top:12px">
   <h2>ログ</h2>
   <div id="log"></div>
 </div>
@@ -236,7 +277,7 @@ const IO_TYPES = {
    ============================================================ */
 const DEFAULTS = {
   throttleSrc:"triggers", rtIndex:7, ltIndex:6, thrAxis:1, strAxis:0,
-  maxPower:70, deadzone:10, expo:35,
+  driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
   steerMode:"position", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
 };
@@ -259,10 +300,12 @@ function save(){
 /* ============================================================
    状態
    ============================================================ */
-let device = null, characteristic = null, canWriteWithoutResponse = false;
+let device = null, characteristic = null;
+let canWriteWithoutResponse = false, canWrite = true;
 let connected = false;
 let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
-let txCount = 0, errCount = 0;
+let txCount = 0, errCount = 0, rxCount = 0;
+let testing = false;               // 診断テスト中は通常の制御出力を止める
 let steerPort = null;              // 現在ステアリングに割り当てられているポート番号
 let steerCenter = null;            // センターとみなす角度（POS カウンタ値）
 let steerActual = null;            // 実測角度
@@ -272,12 +315,16 @@ const lastSent = {};               // key -> { value, time }
 
 const $ = id => document.getElementById(id);
 
+const logLines = [];
 function log(msg){
-  const el = $("log");
   const t = new Date().toLocaleTimeString("ja-JP", { hour12:false });
-  el.textContent += `[${t}] ${msg}\n`;
+  logLines.push(`[${t}] ${msg}`);
+  if (logLines.length > 300) logLines.splice(0, logLines.length - 300);
+  const el = $("log");
+  el.textContent = logLines.join("\n") + "\n";
   el.scrollTop = el.scrollHeight;
 }
+const hex = bytes => Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join(" ");
 
 /* ============================================================
    送信キュー
@@ -285,6 +332,17 @@ function log(msg){
    キューに通す。同じキー（ポート）の未送信コマンドは新しい値で
    上書きされるので、古い指示が溜まって遅延することがない。
    ============================================================ */
+// 実際の GATT 書き込み。設定した方式が使えなければ、もう一方に自動で落とす。
+// Windows の Chrome では writeValueWithoutResponse が無言で届かない例があるため、
+// 既定は応答あり（writeValue）にしてある。
+async function writeRaw(bytes){
+  const preferWithout = cfg.writeMode === "without";
+  if (preferWithout && canWriteWithoutResponse) return characteristic.writeValueWithoutResponse(bytes);
+  if (!preferWithout && canWrite) return characteristic.writeValue(bytes);
+  if (canWriteWithoutResponse) return characteristic.writeValueWithoutResponse(bytes);
+  return characteristic.writeValue(bytes);
+}
+
 const pending = new Map();         // key -> { bytes, force }
 let draining = false, drainTimer = null;
 const MIN_INTERVAL_MS = 35;        // 同一ポートへの最短送信間隔（BLE の帯域を守る）
@@ -319,9 +377,9 @@ async function drain(){
       pending.delete(key);
       lastSent[key] = performance.now();
       try {
-        if (canWriteWithoutResponse) await characteristic.writeValueWithoutResponse(bytes);
-        else await characteristic.writeValue(bytes);
+        await writeRaw(bytes);
         txCount++;
+        if (cfg.hexLog) log("TX " + hex(bytes));
       } catch (e){
         errCount++;
         if (errCount % 20 === 1) log("送信エラー: " + (e && e.message ? e.message : e));
@@ -342,6 +400,20 @@ function cmdPower(port, power){
   let p = Math.max(-100, Math.min(100, Math.round(power)));
   if (p < 0) p = 256 + p;                       // 符号付き8bit
   return new Uint8Array([0x08, 0x00, 0x81, port, 0x11, 0x51, 0x00, p]);
+}
+
+// Port Output Command / StartSpeed（パワー指定が効かないモーター向けの代替）
+function cmdSpeed(port, speed, maxPower){
+  let s = Math.max(-100, Math.min(100, Math.round(speed)));
+  if (s < 0) s = 256 + s;
+  return new Uint8Array([0x09, 0x00, 0x81, port, 0x11, 0x07, s,
+                         Math.max(0, Math.min(100, Math.round(maxPower))), 0x00]);
+}
+
+// 設定に応じた駆動コマンド（0 は必ず「出力オフ」で送る）
+function cmdDrive(port, power){
+  if (power === 0) return cmdPower(port, 0);
+  return cfg.driveCmd === "speed" ? cmdSpeed(port, power, 100) : cmdPower(port, power);
 }
 
 // Port Output Command / GotoAbsolutePosition
@@ -369,6 +441,16 @@ function cmdSubscribe(port, mode, delta){
 // Hub Properties — バッテリー残量の更新通知を有効化
 const CMD_BATTERY_SUB = new Uint8Array([0x05, 0x00, 0x01, 0x06, 0x02]);
 
+// Hub Properties — 単発の問い合わせ（0x05 = Request Update）
+function cmdHubProperty(prop){
+  return new Uint8Array([0x05, 0x00, 0x01, prop, 0x05]);
+}
+const HUB_PROPS = { 0x01:"名前", 0x03:"ファームウェア", 0x04:"ハードウェア", 0x06:"バッテリー", 0x0B:"機種 ID" };
+const SYSTEM_TYPES = {
+  0x00:"WeDo 2.0 Hub", 0x20:"Duplo Train", 0x40:"BOOST Move Hub", 0x41:"2-Port Hub (City)",
+  0x42:"2-Port Handset", 0x80:"Technic Hub (Control+)",
+};
+
 /* ============================================================
    受信メッセージの解析
    ============================================================ */
@@ -376,6 +458,8 @@ function onNotify(event){
   const v = event.target.value;
   const d = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
   if (d.length < 3) return;
+  if (cfg.hexLog) log("RX " + hex(d));
+  rxCount++;
   const type = d[2];
 
   if (type === 0x04){                                   // Hub Attached I/O
@@ -404,10 +488,26 @@ function onNotify(event){
     }
 
   } else if (type === 0x01){                            // Hub Property
-    if (d[3] === 0x06 && d.length >= 6) $("battery").textContent = d[5] + " %";
+    const prop = d[3], body = d.subarray(5);
+    if (prop === 0x06 && body.length >= 1) $("battery").textContent = body[0] + " %";
+    if (prop === 0x01) log(`ハブ名: ${new TextDecoder().decode(body).replace(/\0+$/, "")}`);
+    if (prop === 0x03 || prop === 0x04){
+      log(`${HUB_PROPS[prop]}バージョン: ${hex(body)}`);
+    }
+    if (prop === 0x0B && body.length >= 1){
+      log(`機種 ID: 0x${body[0].toString(16).padStart(2,"0")} (${SYSTEM_TYPES[body[0]] || "一覧にない機種"})`);
+    }
+
+  } else if (type === 0x82){                            // Port Output Command Feedback
+    if (cfg.hexLog) log(`ポート ${PORT_NAMES[d[3]] ?? d[3]}: コマンド受理 (0x${d[4].toString(16)})`);
 
   } else if (type === 0x05){                            // Generic Error
-    log(`ハブがエラーを返しました (command 0x${d[3].toString(16)}, code 0x${d[4].toString(16)})`);
+    const codes = {
+      0x01:"ACK", 0x02:"MACK", 0x03:"バッファ満杯", 0x04:"タイムアウト",
+      0x05:"コマンド未認識", 0x06:"パケット長が不正", 0x07:"パラメーター値が不正",
+      0x08:"コマンドが許可されていない", 0x09:"未初期化", 0x0A:"実行できない状態",
+    };
+    log(`ハブがエラーを返しました: command 0x${d[3].toString(16)} → ${codes[d[4]] || "0x" + d[4].toString(16)}`);
   }
 }
 
@@ -444,6 +544,7 @@ $("connectBtn").addEventListener("click", async () => {
     canWriteWithoutResponse =
       !!(props && props.writeWithoutResponse) &&
       typeof characteristic.writeValueWithoutResponse === "function";
+    canWrite = !props || !!props.write;
 
     try {
       await characteristic.startNotifications();
@@ -454,14 +555,27 @@ $("connectBtn").addEventListener("click", async () => {
 
     connected = true; armed = false;
     steerCenter = null; steerActual = null;
-    txCount = 0; errCount = 0;
+    txCount = 0; errCount = 0; rxCount = 0;
     setConnUI(true);
     $("hubName").textContent = device.name || "(名前なし)";
-    log(`接続完了 (write ${canWriteWithoutResponse ? "without response" : "with response"})`);
+    log(`接続完了 — 書き込み方式: ${cfg.writeMode === "without" ? "応答なし" : "応答あり"}`
+        + ` (対応: ${canWrite ? "write" : "-"}/${canWriteWithoutResponse ? "writeWithoutResponse" : "-"})`);
 
     queueCommand("battery", CMD_BATTERY_SUB, true);
+    queueCommand("prop0b", cmdHubProperty(0x0B), true);   // 機種 ID
     applyRoles();
     requestWakeLock();
+
+    // ハブは接続直後に必ず接続済みデバイスを通知してくる。
+    // 何も届かない = 受信経路が働いていない、という切り分けになる。
+    setTimeout(() => {
+      if (!connected) return;
+      if (rxCount === 0){
+        log("⚠ ハブから 1 件も応答がありません。診断の「ハブ情報を要求」を試してください。");
+      } else if (Object.keys(detected).length === 0){
+        log("⚠ モーターが 1 つも検出されていません。ポート割り当てを手動で設定するか、ポートスキャンで確認してください。");
+      }
+    }, 2500);
 
   } catch (e){
     if (e && (e.name === "NotFoundError" || e.name === "AbortError")){
@@ -490,6 +604,7 @@ function setConnUI(on){
   $("connectBtn").disabled = on;
   $("disconnectBtn").disabled = !on;
   $("calibBtn").disabled = !on;
+  for (const id of ["pingBtn", "scanBtn", "testBtn"]) $(id).disabled = !on;
   const s = $("btState");
   s.textContent = on ? "接続中" : "未接続";
   s.className = "pill " + (on ? "on" : "off");
@@ -638,7 +753,7 @@ function loop(){
   const out = (connected && armed) ? throttle : 0;
 
   updateInputUI(throttle, steer);
-  if (connected) sendControl(out, steer);
+  if (connected && !testing) sendControl(out, steer);
 
   requestAnimationFrame(loop);
 }
@@ -650,7 +765,7 @@ function sendControl(throttle, steer){
     for (const p of [0,1,2,3]){
       const role = cfg.roles[p];
       if (role !== "drive" && role !== "drive_rev") continue;
-      queueCommand("p" + p, cmdPower(p, role === "drive_rev" ? -power : power), power === 0);
+      queueCommand("p" + p, cmdDrive(p, role === "drive_rev" ? -power : power), power === 0);
     }
     lastDrive = power;
     $("outDrive").textContent = power + " %";
@@ -780,6 +895,18 @@ $("cfgSteerMode").addEventListener("change", e => {
   if (connected) subscribeSteer();
 });
 
+$("cfgDriveCmd").value = cfg.driveCmd;
+$("cfgDriveCmd").addEventListener("change", e => { cfg.driveCmd = e.target.value; save(); lastDrive = null; });
+
+$("cfgWriteMode").value = cfg.writeMode;
+$("cfgWriteMode").addEventListener("change", e => {
+  cfg.writeMode = e.target.value; save();
+  log("書き込み方式を「" + (cfg.writeMode === "without" ? "応答なし" : "応答あり") + "」に変更しました");
+});
+
+$("cfgHexLog").checked = cfg.hexLog;
+$("cfgHexLog").addEventListener("change", e => { cfg.hexLog = e.target.checked; save(); });
+
 $("cfgInvert").checked = cfg.invert;
 $("cfgInvert").addEventListener("change", e => { cfg.invert = e.target.checked; save(); });
 
@@ -792,6 +919,87 @@ $("calibBtn").addEventListener("click", () => {
   lastSteer = null;
   log(`ステアリング中央を ${steerCenter}° に再設定しました`);
 });
+
+/* ============================================================
+   診断
+   ============================================================ */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const TEST_PORTS = [0, 1, 2, 3, 4, 5];
+const testPortName = p => PORT_NAMES[p] || String.fromCharCode(65 + p);
+
+// テスト用の直接送信（キューのレート制限を通さず、確実に順番どおり送る）
+async function writeNow(bytes){
+  if (!characteristic) return;
+  try {
+    await writeRaw(bytes);
+    txCount++;
+    if (cfg.hexLog) log("TX " + hex(bytes));
+  } catch (e){
+    errCount++;
+    log("送信エラー: " + (e && e.message ? e.message : e));
+  }
+  $("txStat").textContent = `${txCount} / ${errCount}`;
+}
+
+async function pulsePort(port, power, ms){
+  await writeNow(cmdDrive(port, power));
+  await sleep(ms);
+  await writeNow(cmdPower(port, 0));
+}
+
+$("pingBtn").addEventListener("click", async () => {
+  const before = rxCount;
+  log("ハブに情報を要求しています…");
+  for (const prop of [0x01, 0x03, 0x04, 0x0B, 0x06]){
+    await writeNow(cmdHubProperty(prop));
+    await sleep(60);
+  }
+  await sleep(600);
+  if (rxCount === before){
+    log("⚠ 応答がありません。ハブへの書き込みが届いていないか、通知の購読に失敗しています。");
+  }
+});
+
+$("scanBtn").addEventListener("click", async () => {
+  if (testing) return;
+  testing = true;
+  $("scanBtn").disabled = true;
+  log("ポートスキャン開始 — どのポートで何が動くか見てください");
+  try {
+    for (const p of TEST_PORTS){
+      log(`ポート ${testPortName(p)} を +50% で 0.6 秒…`);
+      await pulsePort(p, 50, 600);
+      await sleep(400);
+    }
+    log("ポートスキャン終了");
+  } finally {
+    testing = false;
+    $("scanBtn").disabled = !connected;
+    lastDrive = null; lastSteer = null;
+  }
+});
+
+$("testBtn").addEventListener("click", async () => {
+  if (testing) return;
+  testing = true;
+  $("testBtn").disabled = true;
+  const port = parseInt($("testPort").value, 10);
+  const power = parseInt($("testPower").value, 10);
+  try {
+    log(`ポート ${testPortName(port)} を ${power}% で 1 秒`);
+    await pulsePort(port, power, 1000);
+  } finally {
+    testing = false;
+    $("testBtn").disabled = !connected;
+    lastDrive = null; lastSteer = null;
+  }
+});
+
+for (const p of TEST_PORTS){
+  const o = document.createElement("option");
+  o.value = p; o.textContent = "ポート " + testPortName(p);
+  $("testPort").appendChild(o);
+}
 
 /* ============================================================
    起動時チェック
