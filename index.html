@@ -105,6 +105,10 @@
     <label>ステアリング入力 <span id="strVal" class="mono">0%</span></label>
     <div class="bar center"><i id="strBar"></i></div>
   </div>
+  <div style="margin-top:10px">
+    <label>旋回入力 <span id="spinVal" class="mono">0%</span></label>
+    <div class="bar center"><i id="spinBar"></i></div>
+  </div>
 
   <div id="mapWarn" class="warnbox" style="margin:12px 0 0" hidden></div>
 
@@ -113,10 +117,12 @@
     <div class="kv"><span>アクセル</span><span id="mapAccel" class="mono">—</span></div>
     <div class="kv"><span>ブレーキ / 後退</span><span id="mapBrake" class="mono">—</span></div>
     <div class="kv"><span>ステアリング</span><span id="mapSteer" class="mono">—</span></div>
+    <div class="kv"><span>旋回（その場回転）</span><span id="mapSpin" class="mono">—</span></div>
     <div class="row" style="margin-top:10px">
       <button class="ghost" data-learn="accel">アクセルを学習</button>
       <button class="ghost" data-learn="brake">ブレーキを学習</button>
       <button class="ghost" data-learn="steer">ステアリングを学習</button>
+      <button class="ghost" data-learn="spin">旋回を学習</button>
     </div>
     <div id="learnMsg" class="note" style="min-height:1.6em"></div>
   </div>
@@ -170,6 +176,23 @@
       <input type="range" id="cfgExpo" min="0" max="100" step="5">
     </div>
   </div>
+
+  <h2 style="margin-top:18px">旋回（その場回転）</h2>
+  <div class="grid">
+    <div>
+      <label>旋回の強さ <span id="lblSpinPower" class="mono"></span></label>
+      <input type="range" id="cfgSpinPower" min="10" max="100" step="5">
+    </div>
+    <div>
+      <label style="display:flex; align-items:center; gap:6px; color:var(--fg); margin-top:22px">
+        <input type="checkbox" id="cfgSpinInvert"> 旋回の向きを反転
+      </label>
+    </div>
+  </div>
+  <p class="note">左右の駆動モーターを逆向きに回して、その場で車体を回転させます。既定では
+  <strong>右スティックの横方向</strong>に割り当てられています。効かない場合はコントローラーの
+  「旋回を学習」を実行してください。前後進と同時に使うと、内輪と外輪に差がついて小回りが利きます。
+  キーボードでは <strong>Q / E</strong> です。</p>
 
   <h2 style="margin-top:18px">ステアリング</h2>
   <div class="grid">
@@ -295,8 +318,9 @@ const DEFAULTS = {
     accel: { kind:"button", index:7, rest:0, dir:1, span:1 },
     brake: { kind:"button", index:6, rest:0, dir:1, span:1 },
     steer: { kind:"axis",   index:0, rest:0, dir:1, span:1 },
+    spin:  { kind:"axis",   index:2, rest:0, dir:1, span:1 },   // 右スティック横
   },
-  autoReconnect:true, reverse:false, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
+  autoReconnect:true, reverse:false, spinPower:50, spinInvert:false, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
   steerMode:"power", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
 };
@@ -611,7 +635,7 @@ function onNotify(event){
           badPorts.add(port);
           log(`⚠ ポート ${portLabel(port)} はモーター指令を受け付けません。送信対象から外します。\n` +
               "  「ポート割り当て」を見直してください。ここに送り続けると接続が切れることがあります。");
-          lastDrive = null; lastSteer = null;
+          lastPortOut = {}; lastSteer = null;
         }
       }
     }
@@ -782,7 +806,7 @@ async function connectOnce(attempt){
   steerCenter = null; steerActual = null;
   txCount = 0; errCount = 0; rxCount = 0; consecutiveErrors = 0;
   // 0 を「送信済み」として始めることで、操作されるまで一切送らない
-  lastDrive = 0; lastSteer = 0;
+  lastPortOut = {}; lastSteer = 0;
 
   // 通知の購読はここで 1 回だけ試す。粘ると最初の書き込みまでが遅れ、
   // その間にハブが接続を切ってしまう。
@@ -1155,10 +1179,14 @@ function renderMap(){
   $("mapAccel").textContent = describeMap(cfg.map.accel);
   $("mapBrake").textContent = describeMap(cfg.map.brake);
   $("mapSteer").textContent = describeMap(cfg.map.steer);
+  $("mapSpin").textContent = describeMap(cfg.map.spin);
 }
 
 // 3 秒間サンプリングして、最も大きく動いた軸／ボタンをその操作に割り当てる。
-const LEARN_LABELS = { accel:"アクセル（前進）", brake:"ブレーキ（後退）", steer:"ステアリング（右いっぱい）" };
+const LEARN_LABELS = {
+  accel:"アクセル（前進）", brake:"ブレーキ（後退）",
+  steer:"ステアリング（右いっぱい）", spin:"旋回（右回り）",
+};
 let learning = false;
 
 async function learnControl(which){
@@ -1223,11 +1251,12 @@ function shape(x){
 /* ============================================================
    制御ループ
    ============================================================ */
-let lastDrive = null, lastSteer = null, bPrev = false, mapWarned = false;
+let lastSteer = null, bPrev = false, mapWarned = false;
+let lastPortOut = {};              // ポートごとに最後に送った出力
 
 function loop(){
   const pad = getPad();
-  let throttle = 0, steer = 0;
+  let throttle = 0, steer = 0, spin = 0;
 
   if (pad){
     $("padState").textContent = "検出";
@@ -1248,6 +1277,7 @@ function loop(){
 
     throttle = readControl(pad, cfg.map.accel, false) - readControl(pad, cfg.map.brake, false);
     steer = readControl(pad, cfg.map.steer, true);
+    spin = readControl(pad, cfg.map.spin, true);
 
     const bNow = btnValue(pad, 1) > 0.5;         // B ボタン（押した瞬間だけ反応）
     if (bNow && !bPrev) stopAll();
@@ -1262,18 +1292,21 @@ function loop(){
     if (keys.has("ArrowDown") || keys.has("KeyS")) throttle = -1;
     if (keys.has("ArrowLeft") || keys.has("KeyA")) steer = -1;
     if (keys.has("ArrowRight") || keys.has("KeyD")) steer = 1;
+    if (keys.has("KeyQ")) spin = -1;
+    if (keys.has("KeyE")) spin = 1;
   }
 
   throttle = shape(Math.max(-1, Math.min(1, throttle)));
   steer = shape(Math.max(-1, Math.min(1, steer)));
+  spin = shape(Math.max(-1, Math.min(1, spin)));
   if (cfg.invert) steer = -steer;
 
   // 安全ロック: 接続直後にアクセルが握られたままでも走り出さない
   if (connected && !armed && Math.abs(throttle) < 0.02) setArmed(true);
   const out = (connected && armed) ? throttle : 0;
 
-  updateInputUI(throttle, steer);
-  if (connected && !testing) sendControl(out, steer);
+  updateInputUI(throttle, steer, spin);
+  if (connected && !testing) sendControl(out, steer, armed ? spin : 0);
 
   requestAnimationFrame(loop);
 }
@@ -1350,20 +1383,36 @@ function portUsable(p){
   return !notifyWorking || Object.keys(detected).length === 0 || !!detected[p];
 }
 
-function sendControl(throttle, steer){
+function sendControl(throttle, steer, spin){
   // ---- 駆動 ----
+  // 左右のモーターは対向して組まれているため、前後進では符号を逆にする。
+  // 旋回はその逆で、両方に同じ符号を与えると物理的に逆向きに押し合い、その場で回る。
   const power = Math.round(throttle * cfg.maxPower) * (cfg.reverse ? -1 : 1);
-  if (lastDrive === null || Math.abs(power - lastDrive) >= 2 || (power === 0 && lastDrive !== 0)){
-    for (const k of Object.keys(cfg.roles)){
-      const role = cfg.roles[k];
-      if (role !== "drive" && role !== "drive_rev") continue;
-      const p = Number(k);
-      if (!portUsable(p)) continue;
-      queueCommand("p" + p, cmdDrive(p, role === "drive_rev" ? -power : power), power === 0);
-    }
-    lastDrive = power;
-    $("outDrive").textContent = power + " %";
+  const spinPower = Math.round(spin * cfg.spinPower) * (cfg.spinInvert ? -1 : 1);
+
+  const outputs = [];
+  for (const k of Object.keys(cfg.roles)){
+    const role = cfg.roles[k];
+    if (role !== "drive" && role !== "drive_rev") continue;
+    const p = Number(k);
+    if (!portUsable(p)) continue;
+    outputs.push([p, (role === "drive_rev" ? -power : power) + spinPower]);
   }
+
+  // 前後進と旋回を足すと 100% を超えることがある。片側だけ頭打ちにすると
+  // 曲がり方が歪むので、超えた分は両輪まとめて同じ比率で下げる。
+  const peak = outputs.reduce((m, [, v]) => Math.max(m, Math.abs(v)), 0);
+  const scale = peak > 100 ? 100 / peak : 1;
+
+  for (const [p, raw] of outputs){
+    const out = Math.round(raw * scale);
+    const prev = lastPortOut[p] ?? 0;
+    if (Math.abs(out - prev) >= 2 || (out === 0 && prev !== 0)){
+      queueCommand("p" + p, cmdDrive(p, out), out === 0);
+      lastPortOut[p] = out;
+    }
+  }
+  $("outDrive").textContent = power + " %" + (spinPower ? ` / 旋回 ${spinPower} %` : "");
 
   // ---- ステアリング ----
   if (steerPort === null || !portUsable(steerPort)) return;
@@ -1422,7 +1471,7 @@ function setArmed(on){
 }
 
 function stopAll(){
-  lastDrive = null; lastSteer = null;
+  lastPortOut = {}; lastSteer = null;
   setArmed(false);
   if (!characteristic) return;
   pending.clear();
@@ -1448,10 +1497,11 @@ function bar(el, v){                     // v: -1 〜 1（中央基点）
   el.style.width = pct + "%";
   el.style.background = v >= 0 ? "var(--accent)" : "var(--warn)";
 }
-function updateInputUI(thr, str){
-  bar($("thrBar"), thr); bar($("strBar"), str);
+function updateInputUI(thr, str, spn){
+  bar($("thrBar"), thr); bar($("strBar"), str); bar($("spinBar"), spn);
   $("thrVal").textContent = Math.round(thr * 100) + "%";
   $("strVal").textContent = Math.round(str * 100) + "%";
+  $("spinVal").textContent = Math.round(spn * 100) + "%";
 }
 let rawTick = 0;
 function updateRawDebug(pad){
@@ -1480,6 +1530,7 @@ function bindRange(id, key, labelId, fmt){
 bindRange("cfgMaxPower", "maxPower", "lblMaxPower", v => v + " %");
 bindRange("cfgDeadzone", "deadzone", "lblDeadzone", v => v + " %");
 bindRange("cfgExpo", "expo", "lblExpo", v => v + " %");
+bindRange("cfgSpinPower", "spinPower", "lblSpinPower", v => v + " %");
 bindRange("cfgSteerAngle", "steerAngle", "lblSteerAngle", v => "±" + v + " °");
 bindRange("cfgSteerPower", "steerPower", "lblSteerPower", v => v + " %");
 bindRange("cfgTrim", "trim", "lblTrim", v => v + " °");
@@ -1491,7 +1542,7 @@ $("cfgSteerMode").addEventListener("change", e => {
 });
 
 $("cfgDriveCmd").value = cfg.driveCmd;
-$("cfgDriveCmd").addEventListener("change", e => { cfg.driveCmd = e.target.value; save(); lastDrive = null; });
+$("cfgDriveCmd").addEventListener("change", e => { cfg.driveCmd = e.target.value; save(); lastPortOut = {}; });
 
 $("cfgWriteMode").value = cfg.writeMode;
 $("cfgWriteMode").addEventListener("change", e => {
@@ -1499,8 +1550,11 @@ $("cfgWriteMode").addEventListener("change", e => {
   log("書き込み方式を「" + (cfg.writeMode === "without" ? "応答なし" : "応答あり") + "」に変更しました");
 });
 
+$("cfgSpinInvert").checked = cfg.spinInvert;
+$("cfgSpinInvert").addEventListener("change", e => { cfg.spinInvert = e.target.checked; save(); lastPortOut = {}; });
+
 $("cfgReverse").checked = cfg.reverse;
-$("cfgReverse").addEventListener("change", e => { cfg.reverse = e.target.checked; save(); lastDrive = null; });
+$("cfgReverse").addEventListener("change", e => { cfg.reverse = e.target.checked; save(); lastPortOut = {}; });
 
 $("cfgAutoReconnect").checked = cfg.autoReconnect;
 $("cfgAutoReconnect").addEventListener("change", e => { cfg.autoReconnect = e.target.checked; save(); });
@@ -1639,7 +1693,7 @@ $("scanBtn").addEventListener("click", async () => {
     scanCurrentPort = null;
     testing = false;
     $("scanBtn").disabled = !connected;
-    lastDrive = null; lastSteer = null;
+    lastPortOut = {}; lastSteer = null;
   }
 });
 
@@ -1655,7 +1709,7 @@ $("testBtn").addEventListener("click", async () => {
   } finally {
     testing = false;
     $("testBtn").disabled = !connected;
-    lastDrive = null; lastSteer = null;
+    lastPortOut = {}; lastSteer = null;
   }
 });
 
