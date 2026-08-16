@@ -97,7 +97,13 @@
     <select id="cfgLightColor" style="flex:1 1 160px"></select>
     <button id="lightBtn" class="ghost" disabled>今すぐ適用</button>
   </div>
-  <p class="note">ハブ内蔵の RGB LED を操作します。選んだ色は接続時にも自動で適用されます。
+  <div style="margin-top:10px">
+    <label>モデルのランプの明るさ <span id="lblLampBrightness" class="mono"></span></label>
+    <input type="range" id="cfgLampBrightness" min="10" max="100" step="5">
+  </div>
+  <p class="note">ハブ内蔵の RGB LED と、「ポート割り当て」で<strong>「ライト」にしたポート</strong>
+  （モデル前後のランプなど）をまとめて操作します。どのポートがランプかは、診断の
+  <strong>「ライトスキャン」</strong>で光らせて確かめてください。選んだ色は接続時にも自動で適用されます。
   <strong>コントローラーのボタン（既定は Y）で消灯／点灯を切り替えられます</strong>
   （割り当てはコントローラーカードの「ライトを学習」で変更できます）。
   <strong>「消灯」にするとハブの接続状態が光で分からなくなる</strong>点にご注意ください
@@ -266,8 +272,12 @@
     <button id="holdBtn" class="ghost" disabled>接続保持テスト</button>
     <button id="pingBtn" class="ghost" disabled>ハブ情報を要求</button>
     <button id="scanBtn" class="ghost" disabled>ポートスキャン (A〜F)</button>
+    <button id="lightScanBtn" class="ghost" disabled>ライトスキャン</button>
   </div>
   <p class="note" style="margin-top:6px">
+    <strong>ライトスキャン</strong>は、駆動・ステアリング以外のポートを 1 つずつ full 点灯させます。
+    <strong>どのポートで前後のランプが光るか</strong>を見て、「ポート割り当て」でそのポートを
+    「ライト」にしてください。以後、コントローラーのボタンでまとめて点灯／消灯できます。<br>
     <strong>接続保持テスト</strong>は、接続だけして GATT 操作を一切行わず 10 秒観察します。
     bluetooth-internals の Connect と同じ条件です。ここで維持されるなら切断のきっかけはこちらの操作側、
     維持されないなら接続そのものが成立していません。
@@ -349,7 +359,7 @@ const DEFAULTS = {
     spin:  { kind:"axis",   index:2, rest:0, dir:1, span:1 },   // 右スティック横
     light: { kind:"button", index:3, rest:0, dir:1, span:1 },   // Y ボタン
   },
-  autoReconnect:true, lightColor:-1, reverse:false, spinPower:50, spinInvert:false, spinSteer:true, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
+  autoReconnect:true, lightColor:-1, lampBrightness:100, reverse:false, spinPower:50, spinInvert:false, spinSteer:true, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
   steerMode:"power", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
 };
@@ -387,6 +397,7 @@ let dropCount = 0;                 // 意図しない切断の回数
 let connectedSince = 0;            // 接続が確立した時刻
 let hubSystemType = null;          // ハブの機種 ID
 let lightState = null;             // 現在のライトの色番号（未設定なら null）
+let lampsOn = true;                // モデルのランプの点灯状態
 let notifyWorking = false;         // ハブからの通知が受け取れているか
 let lastGotoTime = 0;              // 直近に角度指令を送った時刻
 let steerNeedsSub = true;          // 舵角の購読がまだなら true
@@ -559,6 +570,12 @@ function cmdGoto(port, degrees, speed, maxPower){
   b[12] = 126;                                  // EndState: HOLD
   b[13] = 0;                                    // UseProfile: なし
   return b;
+}
+
+// 外付けライトの明るさ（mode 0 = 0〜100）
+function cmdBrightness(port, value){
+  return new Uint8Array([0x08, 0x00, 0x81, port, 0x11, 0x51, 0x00,
+                         Math.max(0, Math.min(100, Math.round(value)))]);
 }
 
 // ハブ内蔵ライトの色（mode 0 = 色番号、0 で消灯）
@@ -1087,7 +1104,7 @@ function setConnUI(on){
   $("disconnectBtn").disabled = !on;
   $("reconnectBtn").disabled = !device;
   $("calibBtn").disabled = !on;
-  for (const id of ["pingBtn", "scanBtn", "testBtn", "lightBtn"]) $(id).disabled = !on;
+  for (const id of ["pingBtn", "scanBtn", "testBtn", "lightBtn", "lightScanBtn"]) $(id).disabled = !on;
   $("holdBtn").disabled = !device;
   const s = $("btState");
   s.textContent = on ? "接続中" : "未接続";
@@ -1133,7 +1150,7 @@ function renderPorts(){
 
     const tdRole = document.createElement("td");
     const sel = document.createElement("select");
-    for (const [val, label] of [["none","使わない"],["drive","駆動"],["drive_rev","駆動（反転）"],["steer","ステアリング"]]){
+    for (const [val, label] of [["none","使わない"],["drive","駆動"],["drive_rev","駆動（反転）"],["steer","ステアリング"],["light","ライト"]]){
       const o = document.createElement("option");
       o.value = val; o.textContent = label;
       if ((cfg.roles[p] || "none") === val) o.selected = true;
@@ -1424,18 +1441,34 @@ function setLight(index){
   lightState = index;
 }
 
-function applyLight(){
-  if (cfg.lightColor < 0) return;          // 「そのまま」なら何も送らない
-  setLight(cfg.lightColor);
+// 「ライト」に割り当てたポート（モデル前後のランプなど）
+function lightRolePorts(){
+  return Object.keys(cfg.roles).filter(k => cfg.roles[k] === "light").map(Number);
 }
 
-// コントローラーのボタンで消灯／点灯を切り替える。
+function setLampsOn(on){
+  for (const p of lightRolePorts()){
+    if (!portUsable(p)) continue;
+    queueCommand("lamp" + p, cmdBrightness(p, on ? cfg.lampBrightness : 0), true);
+  }
+}
+
+function applyLight(){
+  if (cfg.lightColor >= 0) setLight(cfg.lightColor);
+  if (lightRolePorts().length) setLampsOn(lampsOn);
+}
+
+// コントローラーのボタンで、ハブ内蔵 LED とモデルのランプをまとめて切り替える。
 // 点灯時の色は選択中の色。「そのまま」「消灯」を選んでいる場合は白。
 function toggleLight(){
   if (!connected) return;
-  const onColor = cfg.lightColor >= 1 ? cfg.lightColor : 10;
-  setLight(lightState === 0 ? onColor : 0);
-  log(lightState === 0 ? "ライトを消しました" : "ライトを点けました");
+  lampsOn = !lampsOn;
+  setLampsOn(lampsOn);
+  // ハブ内蔵 LED は「そのまま」を選んでいるときは触らない
+  if (cfg.lightColor >= 0){
+    setLight(lampsOn ? (cfg.lightColor >= 1 ? cfg.lightColor : 10) : 0);
+  }
+  log(lampsOn ? "ライトを点けました" : "ライトを消しました");
 }
 
 function logAssignment(){
@@ -1552,7 +1585,8 @@ function stopAll(){
   if (!characteristic) return;
   pending.clear();
   for (const k of Object.keys(cfg.roles)){
-    if (cfg.roles[k] === "none") continue;
+    const role = cfg.roles[k];
+    if (role === "none" || role === "light") continue;   // ライトは消さない
     queueCommand("p" + k, cmdPower(Number(k), 0), true);
   }
   if (steerPort !== null) queueCommand("s" + steerPort, cmdPower(steerPort, 0), true);
@@ -1606,6 +1640,7 @@ function bindRange(id, key, labelId, fmt){
 bindRange("cfgMaxPower", "maxPower", "lblMaxPower", v => v + " %");
 bindRange("cfgDeadzone", "deadzone", "lblDeadzone", v => v + " %");
 bindRange("cfgExpo", "expo", "lblExpo", v => v + " %");
+bindRange("cfgLampBrightness", "lampBrightness", "lblLampBrightness", v => v + " %");
 bindRange("cfgSpinPower", "spinPower", "lblSpinPower", v => v + " %");
 bindRange("cfgSteerAngle", "steerAngle", "lblSteerAngle", v => "±" + v + " °");
 bindRange("cfgSteerPower", "steerPower", "lblSteerPower", v => v + " %");
@@ -1788,6 +1823,55 @@ $("scanBtn").addEventListener("click", async () => {
     testing = false;
     $("scanBtn").disabled = !connected;
     lastPortOut = {}; lastSteer = null;
+  }
+});
+
+// センサー類はライトではないので候補から外す。
+// 駆動・ステアリングに割り当て済みのポートも対象外。
+const SENSOR_TYPES = new Set([
+  0x0005, 0x0014, 0x0015, 0x0016, 0x0022, 0x0023, 0x0024,
+  0x0027, 0x0039, 0x003A, 0x003B, 0x003C,
+]);
+
+function lampCandidates(){
+  return Object.keys(detected).map(Number)
+    .filter(p => !SENSOR_TYPES.has(detectedType[p]))
+    .filter(p => !["drive", "drive_rev", "steer"].includes(cfg.roles[p]))
+    .filter(p => !badPorts.has(p))
+    .sort((a, b) => a - b);
+}
+
+$("lightScanBtn").addEventListener("click", async () => {
+  if (testing) return;
+  const ports = lampCandidates();
+  if (!ports.length){ log("候補になるポートがありません。先にハブへ接続してください。"); return; }
+  testing = true;
+  $("lightScanBtn").disabled = true;
+  log("ライトスキャン開始 — どのポートでランプが光るか見てください");
+  scanRejected.clear();
+  const tried = [];
+  try {
+    for (const p of ports){
+      if (!connected){ log("⚠ 接続が切れたためスキャンを中断しました"); break; }
+      log(`ポート ${portLabel(p)} を全点灯 1 秒…`);
+      scanCurrentPort = p;
+      tried.push(p);
+      // RGB LED は mode 0 が色番号（0〜10）なので、明るさ 100 は不正な値になる
+      const on = detectedType[p] === RGB_LIGHT_TYPE ? cmdLightColor(p, 10) : cmdBrightness(p, 100);
+      await writeNow(on);
+      await sleep(1000);
+      await writeNow(cmdBrightness(p, 0));
+      await sleep(400);
+      scanCurrentPort = null;
+    }
+    const ok = tried.filter(p => !scanRejected.has(p));
+    log("ライトスキャン終了\n" +
+        `  指令を受理したポート: ${ok.length ? ok.map(portLabel).join(", ") : "なし"}\n` +
+        "  実際にランプが光ったポートを「ポート割り当て」で「ライト」にしてください。");
+  } finally {
+    scanCurrentPort = null;
+    testing = false;
+    $("lightScanBtn").disabled = !connected;
   }
 });
 
