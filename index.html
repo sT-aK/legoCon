@@ -90,6 +90,18 @@
   </div>
 </div>
 
+<!-- ライト -->
+<div class="card">
+  <h2>ハブのライト</h2>
+  <div class="row">
+    <select id="cfgLightColor" style="flex:1 1 160px"></select>
+    <button id="lightBtn" class="ghost" disabled>今すぐ適用</button>
+  </div>
+  <p class="note">ハブ内蔵の RGB LED を操作します。選んだ色は接続時にも自動で適用されます。
+  <strong>「消灯」にするとハブの接続状態が光で分からなくなる</strong>点にご注意ください
+  （ページの「状態」表示で確認できます）。</p>
+</div>
+
 <!-- コントローラー -->
 <div class="card">
   <h2>2. コントローラー</h2>
@@ -187,12 +199,17 @@
       <label style="display:flex; align-items:center; gap:6px; color:var(--fg); margin-top:22px">
         <input type="checkbox" id="cfgSpinInvert"> 旋回の向きを反転
       </label>
+      <label style="display:flex; align-items:center; gap:6px; color:var(--fg); margin-top:8px">
+        <input type="checkbox" id="cfgSpinSteer"> 旋回時にステアリングも切る
+      </label>
     </div>
   </div>
   <p class="note">左右の駆動モーターを逆向きに回して、その場で車体を回転させます。既定では
   <strong>右スティックの横方向</strong>に割り当てられています。効かない場合はコントローラーの
-  「旋回を学習」を実行してください。前後進と同時に使うと、内輪と外輪に差がついて小回りが利きます。
-  キーボードでは <strong>Q / E</strong> です。</p>
+  「旋回を学習」を実行してください。キーボードでは <strong>Q / E</strong> です。<br>
+  <strong>回りが弱いときは</strong>「旋回時にステアリングも切る」を有効にしてください。前輪が直進を
+  向いたままだと横滑りを拒んで抵抗になるため、舵を同じ方向へ切ると格段に回りやすくなります。
+  それでも足りなければ「旋回の強さ」を上げてください。</p>
 
   <h2 style="margin-top:18px">ステアリング</h2>
   <div class="grid">
@@ -292,6 +309,12 @@ const LWP3_SERVICE = "00001623-1212-efde-1623-785feabcd123";
 const LWP3_CHAR    = "00001624-1212-efde-1623-785feabcd123";
 
 const PORT_NAMES = { 0:"A", 1:"B", 2:"C", 3:"D" };
+const RGB_LIGHT_TYPE = 0x0017;     // ハブ内蔵の RGB LED
+// mode 0 は色番号指定。0 が消灯。
+const LIGHT_COLORS = [
+  [-1, "そのまま"], [0, "消灯"], [10, "白"], [9, "赤"], [6, "緑"],
+  [3, "青"], [7, "黄"], [8, "橙"], [2, "紫"],
+];
 // A〜D 以外（ハブ内蔵デバイスなど）は番号で表す
 const portLabel = p => PORT_NAMES[p] || `${p} (0x${Number(p).toString(16).padStart(2,"0")})`;
 
@@ -320,7 +343,7 @@ const DEFAULTS = {
     steer: { kind:"axis",   index:0, rest:0, dir:1, span:1 },
     spin:  { kind:"axis",   index:2, rest:0, dir:1, span:1 },   // 右スティック横
   },
-  autoReconnect:true, reverse:false, spinPower:50, spinInvert:false, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
+  autoReconnect:true, lightColor:-1, reverse:false, spinPower:80, spinInvert:false, spinSteer:true, driveCmd:"power", writeMode:"with", maxPower:70, deadzone:10, expo:35, hexLog:false,
   steerMode:"power", steerAngle:60, steerPower:50, trim:0, invert:false,
   roles:{ 0:"drive", 1:"drive", 2:"steer", 3:"none" },
 };
@@ -529,6 +552,11 @@ function cmdGoto(port, degrees, speed, maxPower){
   b[12] = 126;                                  // EndState: HOLD
   b[13] = 0;                                    // UseProfile: なし
   return b;
+}
+
+// ハブ内蔵ライトの色（mode 0 = 色番号、0 で消灯）
+function cmdLightColor(port, index){
+  return new Uint8Array([0x08, 0x00, 0x81, port, 0x11, 0x51, 0x00, index]);
 }
 
 // Port Input Format Setup (Single) — センサー値の通知を有効化
@@ -889,6 +917,7 @@ async function openHub(){
           applyKnownLayout(found);
           checkLayout();
           logAssignment();
+          applyLight();
         }, 2000);
         return true;
       } catch (e){
@@ -1051,7 +1080,7 @@ function setConnUI(on){
   $("disconnectBtn").disabled = !on;
   $("reconnectBtn").disabled = !device;
   $("calibBtn").disabled = !on;
-  for (const id of ["pingBtn", "scanBtn", "testBtn"]) $(id).disabled = !on;
+  for (const id of ["pingBtn", "scanBtn", "testBtn", "lightBtn"]) $(id).disabled = !on;
   $("holdBtn").disabled = !device;
   const s = $("btState");
   s.textContent = on ? "接続中" : "未接続";
@@ -1368,6 +1397,20 @@ $("applyLayoutBtn").addEventListener("click", () => {
   }
 });
 
+function lightPort(){
+  for (const k of Object.keys(detectedType)){
+    if (detectedType[k] === RGB_LIGHT_TYPE) return Number(k);
+  }
+  return null;
+}
+
+function applyLight(){
+  if (cfg.lightColor < 0) return;          // 「そのまま」なら何も送らない
+  const p = lightPort();
+  if (p === null){ log("ハブにライトが見つかりません"); return; }
+  queueCommand("light", cmdLightColor(p, cfg.lightColor), true);
+}
+
 function logAssignment(){
   const byRole = r => Object.keys(cfg.roles).filter(k => cfg.roles[k] === r).map(Number);
   const drive = byRole("drive"), rev = byRole("drive_rev"), steer = byRole("steer");
@@ -1415,6 +1458,10 @@ function sendControl(throttle, steer, spin){
   $("outDrive").textContent = power + " %" + (spinPower ? ` / 旋回 ${spinPower} %` : "");
 
   // ---- ステアリング ----
+  // 前輪が直進を向いたままだと横滑りを拒んで回転の抵抗になる。
+  // 旋回と同じ向きに舵を切ると、前輪が回転を妨げず助ける側に回る。
+  if (cfg.spinSteer && spin !== 0) steer = Math.max(-1, Math.min(1, steer + spin));
+
   if (steerPort === null || !portUsable(steerPort)) return;
   if (cfg.steerMode === "position"){
     // 舵角の購読も、実際にステアリングが操作されるまで送らない
@@ -1549,6 +1596,24 @@ $("cfgWriteMode").addEventListener("change", e => {
   cfg.writeMode = e.target.value; save();
   log("書き込み方式を「" + (cfg.writeMode === "without" ? "応答なし" : "応答あり") + "」に変更しました");
 });
+
+for (const [val, label] of LIGHT_COLORS){
+  const o = document.createElement("option");
+  o.value = val; o.textContent = label;
+  if (cfg.lightColor === val) o.selected = true;
+  $("cfgLightColor").appendChild(o);
+}
+$("cfgLightColor").addEventListener("change", e => {
+  cfg.lightColor = parseInt(e.target.value, 10); save();
+  if (connected) applyLight();
+});
+$("lightBtn").addEventListener("click", () => {
+  if (cfg.lightColor < 0){ log("「そのまま」以外の色を選んでください"); return; }
+  applyLight();
+});
+
+$("cfgSpinSteer").checked = cfg.spinSteer;
+$("cfgSpinSteer").addEventListener("change", e => { cfg.spinSteer = e.target.checked; save(); lastSteer = null; });
 
 $("cfgSpinInvert").checked = cfg.spinInvert;
 $("cfgSpinInvert").addEventListener("change", e => { cfg.spinInvert = e.target.checked; save(); lastPortOut = {}; });
