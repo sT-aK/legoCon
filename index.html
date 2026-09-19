@@ -92,7 +92,9 @@
 
 <!-- ライト -->
 <div class="card">
-  <h2>ハブのライト</h2>
+  <h2>車体とハブのライト</h2>
+  <p class="note">42176のヘッドライト・テールライトは6LEDSの検出後、Yボタンで切り替えられます。
+  ポートの手動割り当ては不要です。電源ボタンのライト色は下で選びます。</p>
   <div class="row">
     <select id="cfgLightColor" style="flex:1 1 160px"></select>
     <button id="lightBtn" class="ghost" disabled>今すぐ適用</button>
@@ -101,9 +103,10 @@
     <label>モデルのランプの明るさ <span id="lblLampBrightness" class="mono"></span></label>
     <input type="range" id="cfgLampBrightness" min="10" max="100" step="5">
   </div>
-  <p class="note">ハブ内蔵の RGB LED と、「ポート割り当て」で<strong>「ライト」にしたポート</strong>
-  （モデル前後のランプなど）をまとめて操作します。どのポートがランプかは、診断の
-  <strong>「ライトスキャン」</strong>で光らせて確かめてください。選んだ色は接続時にも自動で適用されます。
+  <p class="note">車体ライトとハブ内蔵の RGB LED をまとめて操作します。電源ボタンの色が
+  <strong>「そのまま」なら車体ライトだけ</strong>を操作します。
+  外付けライトは「ポート割り当て」で<strong>「ライト」</strong>を選んでください。
+  選んだ色は接続時にも自動で適用されます。
   <strong>コントローラーのボタン（既定は Y）で消灯／点灯を切り替えられます</strong>
   （割り当てはコントローラーカードの「ライトを学習」で変更できます）。
   <strong>「消灯」にするとハブの接続状態が光で分からなくなる</strong>点にご注意ください
@@ -260,6 +263,7 @@
   <div class="kv"><span>ステア目標</span><span id="outSteerTarget" class="mono">—</span></div>
   <div class="kv"><span>ステア実測</span><span id="outSteerActual" class="mono">—</span></div>
   <div class="kv"><span>安全ロック</span><span id="armState" class="pill off">未解除</span></div>
+  <p class="note">ロック解除には、停止ボタンと両トリガーを離し、ステアリング・旋回のスティックを中央に戻してください。</p>
 </div>
 
 <button class="stop" id="stopBtn">緊急停止 (STOP)</button>
@@ -325,6 +329,8 @@ const LWP3_CHAR    = "00001624-1212-efde-1623-785feabcd123";
 
 const PORT_NAMES = { 0:"A", 1:"B", 2:"C", 3:"D" };
 const RGB_LIGHT_TYPE = 0x0017;     // ハブ内蔵の RGB LED
+const SIX_LIGHT_TYPE = 0x0058;     // Technic Move Hub の車体用6LED
+const PLAYVM_TYPE = 0x0059;        // 車両統合制御
 // mode 0 は色番号指定。0 が消灯。
 const LIGHT_COLORS = [
   [-1, "そのまま"], [0, "消灯"], [10, "白"], [9, "赤"], [6, "緑"],
@@ -335,6 +341,7 @@ const portLabel = p => PORT_NAMES[p] || `${p} (0x${Number(p).toString(16).padSta
 
 // Hub Attached I/O で通知される代表的なデバイス種別
 const IO_TYPES = {
+  0x0058:"6LEDS（車体ライト）", 0x0059:"PLAYVM（車両統合制御）",
   0x0001:"Motor", 0x0002:"Train Motor", 0x0005:"Button", 0x0008:"LED",
   0x0014:"Voltage", 0x0015:"Current", 0x0016:"Piezo", 0x0017:"RGB Light",
   0x0022:"Tilt Sensor", 0x0023:"Motion Sensor", 0x0024:"Color/Distance",
@@ -408,7 +415,7 @@ const scanRejected = new Set();    // 指令を拒否したポート
 const badPorts = new Set();        // モーター指令を拒否したポート（送信対象から外す）
 const recentOutputs = [];          // 直近に出力指令を送ったポートの履歴
 let holdTest = false;              // 接続保持テストの実行中
-let armed = false;                 // アクセルが0を通過するまで出力しない安全ロック
+let armed = false;                 // 全操作が中立に戻るまで出力しない安全ロック
 let txCount = 0, errCount = 0, rxCount = 0, consecutiveErrors = 0;
 let testing = false;               // 診断テスト中は通常の制御出力を止める
 let steerPort = null;              // 現在ステアリングに割り当てられているポート番号
@@ -579,6 +586,14 @@ function cmdBrightness(port, value){
 }
 
 // ハブ内蔵ライトの色（mode 0 = 色番号、0 で消灯）
+// 6LEDSは対象マスクと明るさの2バイト。42176のキャビン用(bits 0,3)
+// を除く4灯を選ぶ。参考: https://github.com/toorisrael/LEGO-Porsche-Controller
+function cmdLamp(port, value){
+  if (detectedType[port] !== SIX_LIGHT_TYPE) return cmdBrightness(port, value);
+  return new Uint8Array([0x09, 0x00, 0x81, port, 0x11, 0x51, 0x00, 0x36,
+                        Math.max(0, Math.min(100, Math.round(value)))]);
+}
+
 function cmdLightColor(port, index){
   return new Uint8Array([0x08, 0x00, 0x81, port, 0x11, 0x51, 0x00, index]);
 }
@@ -1189,8 +1204,8 @@ function applyRoles(){
    ============================================================ */
 const keys = new Set();
 addEventListener("keydown", e => {
-  if (e.code === "Space"){ stopAll(); e.preventDefault(); return; }
   keys.add(e.code);
+  if (e.code === "Space"){ stopAll(); e.preventDefault(); return; }
 });
 addEventListener("keyup", e => keys.delete(e.code));
 
@@ -1312,6 +1327,8 @@ let lastPortOut = {};              // ポートごとに最後に送った出力
 function loop(){
   const pad = getPad();
   let throttle = 0, steer = 0, spin = 0;
+  let triggersNeutral = true;
+  let stopHeld = keys.has("Space");
 
   if (pad){
     $("padState").textContent = "検出";
@@ -1330,19 +1347,25 @@ function loop(){
       }
     }
 
-    throttle = readControl(pad, cfg.map.accel, false) - readControl(pad, cfg.map.brake, false);
+    const accel = readControl(pad, cfg.map.accel, false);
+    const brake = readControl(pad, cfg.map.brake, false);
+    throttle = accel - brake;
+    triggersNeutral = Math.abs(shape(accel)) < 0.02 && Math.abs(shape(brake)) < 0.02;
     steer = readControl(pad, cfg.map.steer, true);
     spin = readControl(pad, cfg.map.spin, true);
 
     const bNow = btnValue(pad, 1) > 0.5;         // B ボタン（押した瞬間だけ反応）
     if (bNow && !bPrev) stopAll();
     bPrev = bNow;
+    stopHeld = stopHeld || bNow;
 
     const lNow = readControl(pad, cfg.map.light, false) > 0.5;
     if (lNow && !lightPrev) toggleLight();
     lightPrev = lNow;
     updateRawDebug(pad);
   } else {
+    bPrev = false;
+    lightPrev = false;
     $("padState").textContent = "未検出";
     $("padState").className = "pill off";
     $("padHint").hidden = false;
@@ -1360,12 +1383,15 @@ function loop(){
   spin = shape(Math.max(-1, Math.min(1, spin)));
   if (cfg.invert) steer = -steer;
 
-  // 安全ロック: 接続直後にアクセルが握られたままでも走り出さない
-  if (connected && !armed && Math.abs(throttle) < 0.02) setArmed(true);
-  const out = (connected && armed) ? throttle : 0;
+  // 接続・停止後はすべての操作を中央に戻してから解除する。
+  // 停止ボタン保持中や非表示中、診断中には解除しない。
+  const neutral = triggersNeutral && Math.abs(throttle) < 0.02
+    && Math.abs(steer) < 0.02 && Math.abs(spin) < 0.02;
+  const canControl = connected && !testing && !document.hidden && !stopHeld;
+  if (canControl && !armed && neutral) setArmed(true);
 
   updateInputUI(throttle, steer, spin);
-  if (connected && !testing) sendControl(out, steer, armed ? spin : 0);
+  if (canControl && armed) sendControl(throttle, steer, spin);
 
   requestAnimationFrame(loop);
 }
@@ -1443,13 +1469,17 @@ function setLight(index){
 
 // 「ライト」に割り当てたポート（モデル前後のランプなど）
 function lightRolePorts(){
-  return Object.keys(cfg.roles).filter(k => cfg.roles[k] === "light").map(Number);
+  const ports = new Set(Object.keys(cfg.roles).filter(k => cfg.roles[k] === "light").map(Number));
+  for (const k of Object.keys(detectedType)){
+    if (detectedType[k] === SIX_LIGHT_TYPE) ports.add(Number(k));
+  }
+  return [...ports].filter(p => ![RGB_LIGHT_TYPE, PLAYVM_TYPE].includes(detectedType[p]));
 }
 
 function setLampsOn(on){
   for (const p of lightRolePorts()){
     if (!portUsable(p)) continue;
-    queueCommand("lamp" + p, cmdBrightness(p, on ? cfg.lampBrightness : 0), true);
+    queueCommand("lamp" + p, cmdLamp(p, on ? cfg.lampBrightness : 0), true);
   }
 }
 
@@ -1468,7 +1498,7 @@ function toggleLight(){
   if (cfg.lightColor >= 0){
     setLight(lampsOn ? (cfg.lightColor >= 1 ? cfg.lightColor : 10) : 0);
   }
-  log(lampsOn ? "ライトを点けました" : "ライトを消しました");
+  log(lampsOn ? "ライトの点灯を要求しました" : "ライトの消灯を要求しました");
 }
 
 function logAssignment(){
@@ -1595,7 +1625,12 @@ function stopAll(){
 $("stopBtn").addEventListener("click", stopAll);
 
 // バックグラウンドに回った / タブを閉じた場合は必ず停止
-addEventListener("visibilitychange", () => { if (document.hidden) stopAll(); });
+function suspendControl(){
+  keys.clear();
+  stopAll();
+}
+addEventListener("blur", suspendControl);
+addEventListener("visibilitychange", () => { if (document.hidden) suspendControl(); });
 addEventListener("pagehide", stopAll);
 
 /* ============================================================
@@ -1641,6 +1676,7 @@ bindRange("cfgMaxPower", "maxPower", "lblMaxPower", v => v + " %");
 bindRange("cfgDeadzone", "deadzone", "lblDeadzone", v => v + " %");
 bindRange("cfgExpo", "expo", "lblExpo", v => v + " %");
 bindRange("cfgLampBrightness", "lampBrightness", "lblLampBrightness", v => v + " %");
+$("cfgLampBrightness").addEventListener("input", () => { if (connected) setLampsOn(lampsOn); });
 bindRange("cfgSpinPower", "spinPower", "lblSpinPower", v => v + " %");
 bindRange("cfgSteerAngle", "steerAngle", "lblSteerAngle", v => "±" + v + " °");
 bindRange("cfgSteerPower", "steerPower", "lblSteerPower", v => v + " %");
@@ -1672,7 +1708,6 @@ $("cfgLightColor").addEventListener("change", e => {
   if (connected) applyLight();
 });
 $("lightBtn").addEventListener("click", () => {
-  if (cfg.lightColor < 0){ log("「そのまま」以外の色を選んでください"); return; }
   applyLight();
 });
 
@@ -1713,6 +1748,7 @@ const TEST_PORTS = [0, 1, 2, 3, 4, 5];
 // 機種によって内蔵モーターの番号が違うので、決め打ちでは当たらない。
 // 電圧・電流・各種センサー・LED はモーターではないので回しても無駄。
 const NON_MOTOR_TYPES = new Set([
+  SIX_LIGHT_TYPE, PLAYVM_TYPE,
   0x0005, 0x0008, 0x0014, 0x0015, 0x0016, 0x0017, 0x0022, 0x0023, 0x0024,
   0x0027, 0x0039, 0x003A, 0x003B, 0x003C,
 ]);
@@ -1721,7 +1757,7 @@ function scanPorts(){
   const found = Object.keys(detected).map(Number)
     .filter(p => !NON_MOTOR_TYPES.has(detectedType[p]))
     .sort((a, b) => a - b);
-  return found.length ? found : TEST_PORTS;
+  return Object.keys(detected).length ? found : TEST_PORTS;
 }
 
 // テスト用の直接送信（キューのレート制限を通さず、確実に順番どおり送る）
@@ -1835,6 +1871,7 @@ const SENSOR_TYPES = new Set([
 
 function lampCandidates(){
   return Object.keys(detected).map(Number)
+    .filter(p => ![RGB_LIGHT_TYPE, PLAYVM_TYPE, 0x0056, 0x0057].includes(detectedType[p]))
     .filter(p => !SENSOR_TYPES.has(detectedType[p]))
     .filter(p => !["drive", "drive_rev", "steer"].includes(cfg.roles[p]))
     .filter(p => !badPorts.has(p))
@@ -1857,10 +1894,10 @@ $("lightScanBtn").addEventListener("click", async () => {
       scanCurrentPort = p;
       tried.push(p);
       // RGB LED は mode 0 が色番号（0〜10）なので、明るさ 100 は不正な値になる
-      const on = detectedType[p] === RGB_LIGHT_TYPE ? cmdLightColor(p, 10) : cmdBrightness(p, 100);
+      const on = cmdLamp(p, 100);
       await writeNow(on);
       await sleep(1000);
-      await writeNow(cmdBrightness(p, 0));
+      await writeNow(cmdLamp(p, 0));
       await sleep(400);
       scanCurrentPort = null;
     }
