@@ -361,7 +361,7 @@
   <div id="log"></div>
 </div>
 
-<script src="light-effects.js?v=2"></script>
+<script src="light-effects.js?v=3"></script>
 <script>
 "use strict";
 
@@ -1538,6 +1538,18 @@ function lightRolePorts(){
   return [...ports].filter(p => ![RGB_LIGHT_TYPE, PLAYVM_TYPE].includes(detectedType[p]));
 }
 
+function queueLampFrame(port, groups){
+  const prefix = `led:${port}:`;
+  // Drop obsolete unsent groups as a unit; retain drive/steering and other ports.
+  for (const key of pending.keys()) if (String(key).startsWith(prefix)) pending.delete(key);
+  for (const {mask,value} of groups){
+    const bytes = cmdLamp(port,value,mask);
+    noteOutput(bytes);
+    pending.set(prefix + mask, {bytes,force:false});
+  }
+  drain();
+}
+
 function setLampsOn(on, resetEffect = true){
   if (LightEffects.ready) {
     if (resetEffect) LightEffects.steady(on); else LightEffects.setBase(on);
@@ -2043,7 +2055,7 @@ LightEffects.init({
   brightness: () => cfg.lampBrightness,
   hasLights: () => Object.values(detectedType).includes(SIX_LIGHT_TYPE),
   ports: () => Object.keys(detectedType).map(Number).filter(p => detectedType[p] === SIX_LIGHT_TYPE && portUsable(p)),
-  send: (port,bit,value) => queueCommand(`led:${port}:${bit}`, cmdLamp(port,value,1 << bit), false),
+  sendFrame: queueLampFrame,
   clear: () => { for (const key of pending.keys()) if (String(key).startsWith("led:") || String(key).startsWith("lamp")) pending.delete(key); },
   toggle: () => toggleLight(),
   message: text => log(text),

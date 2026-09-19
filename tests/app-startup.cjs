@@ -27,5 +27,5 @@ events.blur();events.pagehide();
 assert.equal(elements.get('guideStop').textContent,'Menu（≡）');
 assert(elements.get('lightEffects').innerHTML.includes('保存して適用'));
 assert.equal(elements.get('effect_wave').value,'blink');
-assert.equal(elements.get('lightSlot0').value,1);
+assert.equal(elements.get('lightSlot0').value,2);
 console.log('Full application startup, lighting UI and page suspension passed.');

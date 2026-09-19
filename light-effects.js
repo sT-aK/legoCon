@@ -1,7 +1,7 @@
 /* Four configurable light positions, two persistent presets, one composed output. */
 const LightEffects = (() => {
   const positions = ['左前', '右前', '左後', '右後'];
-  const defaults = () => ({slots:[1,2,4,5], selected:0, presets:[
+  const defaults = () => ({layoutVersion:2, slots:[2,1,4,5], selected:0, presets:[
     {wave:'blink', period:1000, low:0, high:100, duty:50, target:'all'},
     {wave:'fade', period:2000, low:0, high:100, duty:50, target:'all'},
   ]});
@@ -10,6 +10,8 @@ const LightEffects = (() => {
     const d = defaults();
     if (!raw || typeof raw !== 'object') return d;
     if (Array.isArray(raw.slots) && raw.slots.length === 4 && new Set(raw.slots).size === 4 && raw.slots.every(n => Number.isInteger(n) && n >= 0 && n < 6)) d.slots = [...raw.slots];
+    // Migrate only the old default; preserve manually calibrated layouts.
+    if (raw.layoutVersion !== 2 && d.slots.join(',') === '1,2,4,5') d.slots = [2,1,4,5];
     d.selected = raw.selected === 1 ? 1 : 0;
     d.presets = d.presets.map((p,i) => {
       const s = raw.presets && raw.presets[i] || p;
@@ -29,6 +31,11 @@ const LightEffects = (() => {
     return Math.round(p.low + (p.high-p.low)*v);
   }
   function indices(target){ return ({all:[0,1,2,3],left:[0,2],right:[1,3],front:[0,1],rear:[2,3]})[target] || [0,1,2,3]; }
+  function groups(values){
+    const masks = new Map();
+    values.forEach((value,bit) => masks.set(value,(masks.get(value) || 0) | (1 << bit)));
+    return [...masks].map(([value,mask]) => ({mask,value}));
+  }
   let config = defaults(), adapter = null, active = null, baseOn = true, last = new Map(), held = new Set(), inputReady = false;
   let connectedBefore = false, test = null, ready = false;
   function save(){
@@ -89,11 +96,12 @@ const LightEffects = (() => {
       indices(active.target).forEach(i => {values[config.slots[i]] = value;});
     }
     if (test) { values.fill(0); values[test.bit] = 70; }
-    // Six independent queue keys prevent a newer left command from replacing a right command.
-    adapter.ports().forEach(port => values.forEach((value,bit) => {
-      const key = `${port}:${bit}`;
-      if (last.get(key) !== value) { adapter.send(port,bit,value); last.set(key,value); }
-    }));
+    // Replace complete pending frames, grouping equal brightness into one masked write.
+    // Complete snapshots also cover commands replaced before they reach the hub.
+    adapter.ports().forEach(port => {
+      const signature = values.join(',');
+      if (last.get(port) !== signature) { adapter.sendFrame(port,groups(values)); last.set(port,signature); }
+    });
   }
   function renderEditor(){
     const p = config.presets[config.selected];
@@ -103,6 +111,7 @@ const LightEffects = (() => {
   function init(a){
     adapter = a;
     try { config = normalize(JSON.parse(localStorage.getItem('legocon.lightEffects.v1'))); } catch { config = defaults(); }
+    save();
     const host = document.getElementById('lightEffects');
     host.innerHTML = `<h2>ライトの操作</h2>
       <p class="note">Y：4灯ハザード ／ B：全灯オン・オフ ／ LB・RB：左・右ウインカー。もう一度押すと点滅を終了します。全灯は登録した車体4灯です。</p>
@@ -121,7 +130,7 @@ const LightEffects = (() => {
         <div><label for="effect_target">A・Xで点滅する場所</label><select id="effect_target"><option value="all">4灯すべて</option><option value="left">左2灯</option><option value="right">右2灯</option><option value="front">前2灯</option><option value="rear">後2灯</option></select></div>
       </div><button id="saveEffect" type="button" style="margin-top:10px">保存して適用</button><p id="effectSaveStatus" role="status" class="note"></p></details>
       <details style="margin-top:12px"><summary>前後左右のライトを入れ替える</summary>
-      <p class="note">初期の位置は仮設定です。各位置にLED 1〜6を割り当て、「確認」で1灯ずつ点けてください。同じ番号を選ぶと位置を交換します。設定は自動保存されます。</p>
+      <p class="note">初期配置はフロントの透明チューブの左右交差を反映しています。各位置にLED 1〜6を割り当て、「確認」で1灯ずつ点けてください。同じ番号を選ぶと位置を交換します。設定は自動保存されます。</p>
       <div class="grid">${positions.map((name,i) => `<div><label for="lightSlot${i}">${name}</label><select id="lightSlot${i}">${Array.from({length:6},(_,bit) => `<option value="${bit}">LED ${bit+1}</option>`).join('')}</select><button type="button" class="ghost" data-light-test="${i}" style="margin-top:6px">${name}を確認（2秒）</button></div>`).join('')}</div></details>
       <p class="note">点滅はページを開いている間に動作します。切断・画面を離れたときは点滅を解除します。緊急停止はMenu（≡）・画面STOP・Spaceです。</p>`;
     host.querySelectorAll('[data-effect]').forEach(el => el.addEventListener('click',() => action(el.dataset.effect)));
@@ -153,5 +162,5 @@ const LightEffects = (() => {
     }));
     ready = true; renderEditor(); status(); setInterval(tick,100);
   }
-  return {init, poll, steady, setBase, suspend, invalidate, action, tick, normalize, level, indices, get ready(){return ready;}};
+  return {init, poll, steady, setBase, suspend, invalidate, action, tick, normalize, level, indices, groups, get ready(){return ready;}};
 })();
