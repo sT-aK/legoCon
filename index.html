@@ -60,6 +60,15 @@
   th,td{text-align:left; padding:6px 4px; border-bottom:1px solid var(--line)}
   th{color:var(--muted); font-weight:600; font-size:12px}
   td select{padding:6px 8px; font-size:14px}
+  .controller-map{margin:14px 0; padding:12px; background:#15181e; border:1px solid var(--line); border-radius:12px}
+  .controller-map svg{display:block; width:100%; max-width:460px; margin:auto; height:auto}
+  .controller-map svg text{font-family:inherit; fill:var(--fg); text-anchor:middle; font-size:15px; font-weight:600}
+  .control-guide{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:0}
+  .control-guide > div{background:var(--panel2); border-radius:9px; padding:10px; min-width:0}
+  .control-guide dt{font-size:13px; color:var(--muted)}
+  .control-guide dd{margin:3px 0 0; font-weight:600; font-size:14px; overflow-wrap:anywhere}
+  .control-guide .stop-guide{border:1px solid var(--err)}
+  #padId{overflow-wrap:anywhere; min-width:0}
 </style>
 </head>
 <body>
@@ -120,6 +129,36 @@
   <div class="kv"><span>ID</span><span id="padId" class="mono" style="font-size:12px; text-align:right">—</span></div>
   <p class="note" id="padHint">コントローラーを接続したら、いずれかのボタンを1回押してください（ブラウザは初回入力があるまでゲームパッドを認識しません）。</p>
 
+  <section class="controller-map" aria-label="コントローラーの操作ガイド">
+    <h2>どのボタンで操作する？</h2>
+    <p class="note" id="guideHint">Xboxの標準配置です。下の一覧は現在の割り当てを表示します。</p>
+    <svg id="controllerDiagram" viewBox="0 0 440 245" role="img" aria-labelledby="controllerTitle controllerDesc">
+      <title id="controllerTitle">Xboxコントローラーのボタン位置</title>
+      <desc id="controllerDesc">左上にLT、右上にRT。左スティックは左側、右スティックは右下。右側の4ボタンは上がY、右がB、下がA、左がXです。各操作の割り当ては下の一覧を参照してください。</desc>
+      <rect x="76" y="8" width="66" height="32" rx="10" fill="#333e50"/><text x="109" y="30">LT</text>
+      <rect x="298" y="8" width="66" height="32" rx="10" fill="#333e50"/><text x="331" y="30">RT</text>
+      <path d="M108 49 Q66 46 48 105 L25 195 Q22 224 48 226 Q65 229 98 191 L342 191 Q375 229 392 226 Q418 224 415 195 L392 105 Q374 46 332 49 Z" fill="#262a32" stroke="#536076" stroke-width="2"/>
+      <text x="111" y="70">LB</text><text x="329" y="70">RB</text>
+      <circle cx="110" cy="113" r="29" fill="#15181e" stroke="#7196c2" stroke-width="2"/><text x="110" y="118">左 ↔</text>
+      <circle cx="275" cy="165" r="29" fill="#15181e" stroke="#7196c2" stroke-width="2"/><text x="275" y="170">右 ↔</text>
+      <path d="M152 146 h18 v17 h17 v18 h-17 v17 h-18 v-17 h-17 v-18 h17 Z" fill="#15181e"/>
+      <circle cx="332" cy="94" r="17" fill="#655014"/><text x="332" y="99">Y</text>
+      <circle cx="365" cy="126" r="17" fill="#77333c"/><text x="365" y="131">B</text>
+      <circle cx="332" cy="158" r="17" fill="#26523d"/><text x="332" y="163">A</text>
+      <circle cx="299" cy="126" r="17" fill="#294c77"/><text x="299" y="131">X</text>
+      <circle cx="204" cy="112" r="8" fill="#536076"/><circle cx="237" cy="112" r="8" fill="#536076"/>
+    </svg>
+    <dl class="control-guide">
+      <div><dt>前進・アクセル</dt><dd id="guideAccel">RT · 右トリガー</dd></div>
+      <div><dt>ブレーキ・後退</dt><dd id="guideBrake">LT · 左トリガー</dd></div>
+      <div><dt>ハンドルを切る</dt><dd id="guideSteer">左スティック ↔</dd></div>
+      <div><dt>旋回する</dt><dd id="guideSpin">右スティック ↔</dd></div>
+      <div><dt>前後ライト 点灯／消灯</dt><dd id="guideLight">Y</dd></div>
+      <div class="stop-guide"><dt>緊急停止（固定）</dt><dd id="guideStop">B</dd></div>
+    </dl>
+    <p class="note">旋回は左右の車輪の速度差で曲がります。割り当てを変更すると、この一覧も更新されます。</p>
+  </section>
+
   <div style="margin-top:12px">
     <label>アクセル / ブレーキ <span id="thrVal" class="mono">0%</span></label>
     <div class="bar center"><i id="thrBar"></i></div>
@@ -135,8 +174,8 @@
 
   <div id="mapWarn" class="warnbox" style="margin:12px 0 0" hidden></div>
 
-  <div style="margin-top:14px">
-    <label>入力の割り当て</label>
+  <details style="margin-top:14px">
+    <summary>ボタンの割り当てを変更する</summary>
     <div class="kv"><span>アクセル</span><span id="mapAccel" class="mono">—</span></div>
     <div class="kv"><span>ブレーキ / 後退</span><span id="mapBrake" class="mono">—</span></div>
     <div class="kv"><span>ステアリング</span><span id="mapSteer" class="mono">—</span></div>
@@ -150,7 +189,7 @@
       <button class="ghost" data-learn="light">ライトを学習</button>
     </div>
     <div id="learnMsg" class="note" style="min-height:1.6em"></div>
-  </div>
+  </details>
 
   <details style="margin-top:12px">
     <summary>生の入力値を表示</summary>
@@ -1211,9 +1250,10 @@ addEventListener("keyup", e => keys.delete(e.code));
 
 addEventListener("gamepadconnected", e => {
   mapWarned = false;
+  renderMap();
   log(`コントローラー検出: ${e.gamepad.id} (mapping: ${e.gamepad.mapping || "非標準"})`);
 });
-addEventListener("gamepaddisconnected", e => { log("コントローラー切断"); stopAll(); });
+addEventListener("gamepaddisconnected", e => { log("コントローラー切断"); stopAll(); renderMap(); });
 
 function getPad(){
   const pads = navigator.getGamepads ? navigator.getGamepads() : [];
@@ -1249,6 +1289,21 @@ function renderMap(){
   $("mapSteer").textContent = describeMap(cfg.map.steer);
   $("mapSpin").textContent = describeMap(cfg.map.spin);
   $("mapLight").textContent = describeMap(cfg.map.light);
+  const pad = getPad();
+  const standard = !pad || pad.mapping === "standard";
+  const buttons = ["A", "B", "X", "Y", "LB", "RB", "LT · 左トリガー", "RT · 右トリガー",
+    "View", "Menu", "左スティック押し込み", "右スティック押し込み", "十字キー ↑", "十字キー ↓", "十字キー ←", "十字キー →", "Xbox"];
+  const axes = ["左スティック ↔", "左スティック ↕", "右スティック ↔", "右スティック ↕"];
+  for (const [key, id] of Object.entries({accel:"guideAccel", brake:"guideBrake", steer:"guideSteer", spin:"guideSpin", light:"guideLight"})){
+    const m = cfg.map[key];
+    const name = m && standard ? (m.kind === "axis" ? axes : buttons)[m.index] : null;
+    $(id).textContent = name ? name + (m.dir < 0 ? "（反転）" : "") : describeMap(m);
+  }
+  $("guideStop").textContent = standard ? "B" : "button[1]";
+  $("controllerDiagram").style.display = standard ? "block" : "none";
+  $("guideHint").textContent = standard
+    ? (pad ? "Xboxの標準配置です。下の一覧は現在の割り当てを表示します。" : "接続前はXboxの標準配置で表示しています。下の一覧には保存済みの割り当てを反映します。")
+    : "このコントローラーは標準配置として認識されていません。入力番号で表示します。「ボタンの割り当てを変更する」から学習してください。";
 }
 
 // 3 秒間サンプリングして、最も大きく動いた軸／ボタンをその操作に割り当てる。
