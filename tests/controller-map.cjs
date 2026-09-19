@@ -23,11 +23,12 @@ run('renderMap()');
 assert.equal(elements.get('guideAccel').textContent, 'RT · 右トリガー');
 assert.equal(elements.get('guideLight').textContent, 'Y');
 run('cfg.map.light.index = 0; renderMap()');
-assert.equal(elements.get('guideLight').textContent, 'A');
-assert.equal(elements.get('guideStop').textContent, 'B');
+assert.equal(elements.get('guideLight').textContent, 'Y'); // Legacy learned setting no longer changes fixed lighting controls.
+assert.equal(elements.get('guideAll').textContent, 'B');
+assert.equal(elements.get('guideStop').textContent, 'Menu（≡）');
 run('pad = {mapping:""}; renderMap()');
-assert.equal(elements.get('guideLight').textContent, 'button[0]');
-assert.equal(elements.get('guideStop').textContent, 'button[1]');
+assert.equal(elements.get('guideLight').textContent, 'button[3]');
+assert.equal(elements.get('guideStop').textContent, 'button[9]');
 assert.equal(elements.get('controllerDiagram').style.display, 'none');
 run('pad = {mapping:"standard"}; cfg.map.steer.dir = -1; renderMap()');
 assert.equal(elements.get('guideSteer').textContent, '左スティック ↔（反転）');

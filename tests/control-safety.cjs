@@ -16,7 +16,8 @@ function setup() {
   const elements = new Map();
   const events = {};
   const ctx = vm.createContext({
-    connected: true, armed: false, testing: false, characteristic: {},
+    connected: true, armed: false, testing: false, learning: false, characteristic: {},
+    LightEffects: {poll() {}, invalidate() {}, suspend() {}},
     steerPort: 52, pending: new Map(), document: { hidden: false },
     cfg: { roles: {50: 'drive_rev', 51: 'drive', 52: 'steer', 63: 'light'},
       map: {accel: 'accel', brake: 'brake', steer: 'steer', spin: 'spin', light: 'light'} },
@@ -26,7 +27,7 @@ function setup() {
     addEventListener: (name, fn) => { events[name] = fn; },
     log() {}, updateRawDebug() {}, updateInputUI() {}, toggleLight() {},
     requestAnimationFrame() {}, shape: x => x,
-    readControl: (pad, key) => pad[key], btnValue: pad => pad.stop,
+    readControl: (pad, key) => pad[key], btnValue: (pad, index) => index === 9 ? pad.stop : 0,
     cmdPower: (port, power) => ({port, power}),
   });
   vm.runInContext(`
@@ -63,7 +64,7 @@ test('equal accelerator and brake inputs cannot unlock', () => {
   run('pad.accel = 1; pad.brake = 1; loop();');
   assert.equal(ctx.armed, false);
 });
-test('B stays stopped while held and requires neutral before resuming', () => {
+test('Menu stays stopped while held and requires neutral before resuming', () => {
   const {ctx, run} = setup();
   run('loop(); pad.stop = 1; loop(); loop();');
   assert.equal(ctx.armed, false);

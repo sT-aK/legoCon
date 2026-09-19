@@ -15,6 +15,7 @@ const ctx = vm.createContext({
   detectedType: {50: 0x56, 51: 0x56, 52: 0x57, 53: 0x58, 54: 0x59, 63: 0x17},
   detected: {50: 'motor', 51: 'motor', 52: 'steer', 53: '6LEDS', 54: 'PLAYVM', 63: 'RGB'},
   connected: true, lampsOn: true, lightState: null, badPorts: new Set(),
+  LightEffects: {ready:false},
   notifyWorking: true, commands: [], log() {},
 });
 vm.runInContext(`
@@ -31,6 +32,7 @@ assert.deepEqual(json('Array.from(cmdLamp(53, 65))'), [9,0,0x81,53,0x11,0x51,0,0
 assert.deepEqual(json('Array.from(cmdLamp(53, 0))'), [9,0,0x81,53,0x11,0x51,0,0x36,0]);
 assert.equal(run('cmdLamp(53, 999)[8]'), 100);
 assert.equal(run('cmdLamp(53, -5)[8]'), 0);
+for (let bit = 0; bit < 6; bit++) assert.equal(run(`cmdLamp(53, 50, ${1 << bit})[7]`), 1 << bit);
 assert.deepEqual(json('lightRolePorts()'), [53]);
 run('toggleLight();');
 assert.equal(ctx.commands.length, 1);

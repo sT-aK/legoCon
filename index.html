@@ -100,9 +100,10 @@
 </div>
 
 <!-- ライト -->
+<div class="card" id="lightEffects"></div>
 <div class="card">
   <h2>車体とハブのライト</h2>
-  <p class="note">42176のヘッドライト・テールライトは6LEDSの検出後、Yボタンで切り替えられます。
+  <p class="note">42176のヘッドライト・テールライトは6LEDSの検出後、Bボタンで切り替えられます。
   ポートの手動割り当ては不要です。電源ボタンのライト色は下で選びます。</p>
   <div class="row">
     <select id="cfgLightColor" style="flex:1 1 160px"></select>
@@ -116,8 +117,7 @@
   <strong>「そのまま」なら車体ライトだけ</strong>を操作します。
   外付けライトは「ポート割り当て」で<strong>「ライト」</strong>を選んでください。
   選んだ色は接続時にも自動で適用されます。
-  <strong>コントローラーのボタン（既定は Y）で消灯／点灯を切り替えられます</strong>
-  （割り当てはコントローラーカードの「ライトを学習」で変更できます）。
+  <strong>Bで全灯、Yでハザード、LB・RBで左右のウインカーを操作します。</strong>
   <strong>「消灯」にするとハブの接続状態が光で分からなくなる</strong>点にご注意ください
   （ページの「状態」表示で確認できます）。</p>
 </div>
@@ -153,8 +153,13 @@
       <div><dt>ブレーキ・後退</dt><dd id="guideBrake">LT · 左トリガー</dd></div>
       <div><dt>ハンドルを切る</dt><dd id="guideSteer">左スティック ↔</dd></div>
       <div><dt>旋回する</dt><dd id="guideSpin">右スティック ↔</dd></div>
-      <div><dt>前後ライト 点灯／消灯</dt><dd id="guideLight">Y</dd></div>
-      <div class="stop-guide"><dt>緊急停止（固定）</dt><dd id="guideStop">B</dd></div>
+      <div><dt>4灯ハザード</dt><dd id="guideLight">Y</dd></div>
+      <div><dt>全灯 点灯／消灯</dt><dd id="guideAll">B</dd></div>
+      <div><dt>左2灯 ウインカー</dt><dd id="guideLeft">LB</dd></div>
+      <div><dt>右2灯 ウインカー</dt><dd id="guideRight">RB</dd></div>
+      <div><dt>カスタム モード1</dt><dd id="guideA">A</dd></div>
+      <div><dt>カスタム モード2</dt><dd id="guideX">X</dd></div>
+      <div class="stop-guide"><dt>緊急停止（固定）</dt><dd id="guideStop">Menu（≡）</dd></div>
     </dl>
     <p class="note">旋回は左右の車輪の速度差で曲がります。割り当てを変更すると、この一覧も更新されます。</p>
   </section>
@@ -180,13 +185,12 @@
     <div class="kv"><span>ブレーキ / 後退</span><span id="mapBrake" class="mono">—</span></div>
     <div class="kv"><span>ステアリング</span><span id="mapSteer" class="mono">—</span></div>
     <div class="kv"><span>旋回</span><span id="mapSpin" class="mono">—</span></div>
-    <div class="kv"><span>ライト切り替え</span><span id="mapLight" class="mono">—</span></div>
+    <div class="kv"><span>ライト操作（固定）</span><span id="mapLight">Y / B / A / X / LB / RB</span></div>
     <div class="row" style="margin-top:10px">
       <button class="ghost" data-learn="accel">アクセルを学習</button>
       <button class="ghost" data-learn="brake">ブレーキを学習</button>
       <button class="ghost" data-learn="steer">ステアリングを学習</button>
       <button class="ghost" data-learn="spin">旋回を学習</button>
-      <button class="ghost" data-learn="light">ライトを学習</button>
     </div>
     <div id="learnMsg" class="note" style="min-height:1.6em"></div>
   </details>
@@ -306,7 +310,7 @@
 </div>
 
 <button class="stop" id="stopBtn">緊急停止 (STOP)</button>
-<p class="note" style="text-align:center">コントローラーの B ボタン / キーボードの Space でも停止します。</p>
+<p class="note" style="text-align:center">コントローラーの Menu（≡）ボタン / キーボードの Space でも停止します。Bはライト操作です。</p>
 
 <div class="card" style="margin-top:12px">
   <h2>診断</h2>
@@ -357,6 +361,7 @@
   <div id="log"></div>
 </div>
 
+<script src="light-effects.js?v=2"></script>
 <script>
 "use strict";
 
@@ -627,9 +632,9 @@ function cmdBrightness(port, value){
 // ハブ内蔵ライトの色（mode 0 = 色番号、0 で消灯）
 // 6LEDSは対象マスクと明るさの2バイト。42176のキャビン用(bits 0,3)
 // を除く4灯を選ぶ。参考: https://github.com/toorisrael/LEGO-Porsche-Controller
-function cmdLamp(port, value){
+function cmdLamp(port, value, mask = 0x36){
   if (detectedType[port] !== SIX_LIGHT_TYPE) return cmdBrightness(port, value);
-  return new Uint8Array([0x09, 0x00, 0x81, port, 0x11, 0x51, 0x00, 0x36,
+  return new Uint8Array([0x09, 0x00, 0x81, port, 0x11, 0x51, 0x00, mask & 0x3f,
                         Math.max(0, Math.min(100, Math.round(value)))]);
 }
 
@@ -1111,6 +1116,7 @@ $("disconnectBtn").addEventListener("click", async () => {
 });
 
 function onDisconnected(){
+  LightEffects.suspend();
   characteristic = null; pending.clear();
   if (holdTest) return;              // 接続保持テストが自分で観測している
   if (selfDisconnect) return;        // やり直しのために自分で切ったもの
@@ -1288,18 +1294,20 @@ function renderMap(){
   $("mapBrake").textContent = describeMap(cfg.map.brake);
   $("mapSteer").textContent = describeMap(cfg.map.steer);
   $("mapSpin").textContent = describeMap(cfg.map.spin);
-  $("mapLight").textContent = describeMap(cfg.map.light);
+  $("mapLight").textContent = "Y / B / A / X / LB / RB（固定）";
   const pad = getPad();
   const standard = !pad || pad.mapping === "standard";
   const buttons = ["A", "B", "X", "Y", "LB", "RB", "LT · 左トリガー", "RT · 右トリガー",
     "View", "Menu", "左スティック押し込み", "右スティック押し込み", "十字キー ↑", "十字キー ↓", "十字キー ←", "十字キー →", "Xbox"];
   const axes = ["左スティック ↔", "左スティック ↕", "右スティック ↔", "右スティック ↕"];
-  for (const [key, id] of Object.entries({accel:"guideAccel", brake:"guideBrake", steer:"guideSteer", spin:"guideSpin", light:"guideLight"})){
+  for (const [key, id] of Object.entries({accel:"guideAccel", brake:"guideBrake", steer:"guideSteer", spin:"guideSpin"})){
     const m = cfg.map[key];
     const name = m && standard ? (m.kind === "axis" ? axes : buttons)[m.index] : null;
     $(id).textContent = name ? name + (m.dir < 0 ? "（反転）" : "") : describeMap(m);
   }
-  $("guideStop").textContent = standard ? "B" : "button[1]";
+  for (const [id,index] of Object.entries({guideLight:3,guideAll:1,guideA:0,guideX:2,guideLeft:4,guideRight:5,guideStop:9})){
+    $(id).textContent = standard ? (index === 9 ? "Menu（≡）" : buttons[index]) : `button[${index}]`;
+  }
   $("controllerDiagram").style.display = standard ? "block" : "none";
   $("guideHint").textContent = standard
     ? (pad ? "Xboxの標準配置です。下の一覧は現在の割り当てを表示します。" : "接続前はXboxの標準配置で表示しています。下の一覧には保存済みの割り当てを反映します。")
@@ -1409,16 +1417,15 @@ function loop(){
     steer = readControl(pad, cfg.map.steer, true);
     spin = readControl(pad, cfg.map.spin, true);
 
-    const bNow = btnValue(pad, 1) > 0.5;         // B ボタン（押した瞬間だけ反応）
+    const bNow = btnValue(pad, 9) > 0.5;         // Menu ボタン：緊急停止
     if (bNow && !bPrev) stopAll();
     bPrev = bNow;
     stopHeld = stopHeld || bNow;
 
-    const lNow = readControl(pad, cfg.map.light, false) > 0.5;
-    if (lNow && !lightPrev) toggleLight();
-    lightPrev = lNow;
+    LightEffects.poll(pad, !connected || testing || learning || document.hidden || stopHeld);
     updateRawDebug(pad);
   } else {
+    LightEffects.poll(null, true);
     bPrev = false;
     lightPrev = false;
     $("padState").textContent = "未検出";
@@ -1531,16 +1538,20 @@ function lightRolePorts(){
   return [...ports].filter(p => ![RGB_LIGHT_TYPE, PLAYVM_TYPE].includes(detectedType[p]));
 }
 
-function setLampsOn(on){
+function setLampsOn(on, resetEffect = true){
+  if (LightEffects.ready) {
+    if (resetEffect) LightEffects.steady(on); else LightEffects.setBase(on);
+  }
   for (const p of lightRolePorts()){
     if (!portUsable(p)) continue;
+    if (LightEffects.ready && detectedType[p] === SIX_LIGHT_TYPE) continue;
     queueCommand("lamp" + p, cmdLamp(p, on ? cfg.lampBrightness : 0), true);
   }
 }
 
 function applyLight(){
   if (cfg.lightColor >= 0) setLight(cfg.lightColor);
-  if (lightRolePorts().length) setLampsOn(lampsOn);
+  if (lightRolePorts().length) setLampsOn(lampsOn, false);
 }
 
 // コントローラーのボタンで、ハブ内蔵 LED とモデルのランプをまとめて切り替える。
@@ -1665,6 +1676,7 @@ function setArmed(on){
 }
 
 function stopAll(){
+  LightEffects.invalidate();
   lastPortOut = {}; lastSteer = null;
   setArmed(false);
   if (!characteristic) return;
@@ -1681,12 +1693,13 @@ $("stopBtn").addEventListener("click", stopAll);
 
 // バックグラウンドに回った / タブを閉じた場合は必ず停止
 function suspendControl(){
+  LightEffects.suspend();
   keys.clear();
   stopAll();
 }
 addEventListener("blur", suspendControl);
 addEventListener("visibilitychange", () => { if (document.hidden) suspendControl(); });
-addEventListener("pagehide", stopAll);
+addEventListener("pagehide", suspendControl);
 
 /* ============================================================
    UI 更新
@@ -1731,7 +1744,7 @@ bindRange("cfgMaxPower", "maxPower", "lblMaxPower", v => v + " %");
 bindRange("cfgDeadzone", "deadzone", "lblDeadzone", v => v + " %");
 bindRange("cfgExpo", "expo", "lblExpo", v => v + " %");
 bindRange("cfgLampBrightness", "lampBrightness", "lblLampBrightness", v => v + " %");
-$("cfgLampBrightness").addEventListener("input", () => { if (connected) setLampsOn(lampsOn); });
+$("cfgLampBrightness").addEventListener("input", () => { if (connected) setLampsOn(lampsOn, false); });
 bindRange("cfgSpinPower", "spinPower", "lblSpinPower", v => v + " %");
 bindRange("cfgSteerAngle", "steerAngle", "lblSteerAngle", v => "±" + v + " °");
 bindRange("cfgSteerPower", "steerPower", "lblSteerPower", v => v + " %");
@@ -2023,6 +2036,18 @@ async function requestWakeLock(){
 }
 
 envCheck();
+LightEffects.init({
+  connected: () => connected,
+  paused: () => document.hidden || testing,
+  now: () => performance.now(),
+  brightness: () => cfg.lampBrightness,
+  hasLights: () => Object.values(detectedType).includes(SIX_LIGHT_TYPE),
+  ports: () => Object.keys(detectedType).map(Number).filter(p => detectedType[p] === SIX_LIGHT_TYPE && portUsable(p)),
+  send: (port,bit,value) => queueCommand(`led:${port}:${bit}`, cmdLamp(port,value,1 << bit), false),
+  clear: () => { for (const key of pending.keys()) if (String(key).startsWith("led:") || String(key).startsWith("lamp")) pending.delete(key); },
+  toggle: () => toggleLight(),
+  message: text => log(text),
+});
 renderPorts();
 renderMap();
 applyRoles();
